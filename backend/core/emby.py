@@ -44,10 +44,13 @@ TICKS_PER_SECOND = 10_000_000
 POSITION_TOLERANCE_SECONDS = 5
 
 
-async def set_playback_position(url: str, token: str, user_id: str, item_id: str, position_seconds: int, client: httpx.AsyncClient | None = None) -> str:
+async def set_playback_position(url: str, token: str, user_id: str, item_id: str, position_seconds: int, client: httpx.AsyncClient | None = None, info: dict | None = None) -> str:
     """Write a resume position onto an Emby item so it shows in Continue Watching.
 
-    Returns "pushed", "skipped" or "failed". Nothing is written when the item is
+    Returns "pushed", "failed" or a "skipped..." reason ("skipped_played",
+    "skipped_emby_ahead", "skipped_at_end", or plain "skipped" for a non-positive
+    position). If ``info`` is given it is filled with Emby's current state
+    (played, emby_seconds, runtime_seconds) for diagnostics. Nothing is written when the item is
     already played, when Emby's own position is already at (or beyond) ours, or
     when the position would be at/after the end of the item (that would be a
     finished play, which is mark_watched's job, not a resume point).
@@ -73,14 +76,16 @@ async def set_playback_position(url: str, token: str, user_id: str, item_id: str
         item_r.raise_for_status()
         item = item_r.json()
         user_data = item.get("UserData") or {}
-        if user_data.get("Played"):
-            return "skipped"
         current = int(user_data.get("PlaybackPositionTicks") or 0)
-        if current >= ticks - POSITION_TOLERANCE_SECONDS * TICKS_PER_SECOND:
-            return "skipped"
         runtime = int(item.get("RunTimeTicks") or 0)
+        if info is not None:
+            info.update(played=bool(user_data.get("Played")), emby_seconds=current // TICKS_PER_SECOND, runtime_seconds=runtime // TICKS_PER_SECOND)
+        if user_data.get("Played"):
+            return "skipped_played"
+        if current >= ticks - POSITION_TOLERANCE_SECONDS * TICKS_PER_SECOND:
+            return "skipped_emby_ahead"
         if runtime and ticks >= runtime:
-            return "skipped"
+            return "skipped_at_end"
         r = await c.post(f"{item_url}/UserData", headers=post_headers, json={**user_data, "PlaybackPositionTicks": ticks})
         return "pushed" if r.status_code < 400 else "failed"
 

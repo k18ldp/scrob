@@ -6796,12 +6796,20 @@ async def _push_emby_playback_progress(db: AsyncSession, conn: MediaServerConnec
 
     sem = asyncio.Semaphore(5)
 
-    async def _push_one(sid: str, seconds: int) -> str:
+    async def _push_one(sid: str, seconds: int) -> tuple[str, int, str, dict]:
+        info: dict = {}
         async with sem:
-            return await emby.set_playback_position(conn.url, conn.token, conn.server_user_id, sid, seconds)
+            outcome = await emby.set_playback_position(conn.url, conn.token, conn.server_user_id, sid, seconds, info=info)
+        return sid, seconds, outcome, info
 
-    for outcome in await asyncio.gather(*(_push_one(sid, seconds) for sid, seconds in targets)):
-        stats[outcome] = stats.get(outcome, 0) + 1
+    shown = 0
+    for sid, seconds, outcome, info in await asyncio.gather(*(_push_one(sid, seconds) for sid, seconds in targets)):
+        key = "skipped" if outcome.startswith("skipped") else outcome
+        stats[key] = stats.get(key, 0) + 1
+        if outcome != "pushed" and shown < 20:
+            shown += 1
+            print(f"  Emby item {sid}: scrob={seconds}s emby={info.get('emby_seconds', '?')}s "
+                  f"played={info.get('played', '?')} length={info.get('runtime_seconds', '?')}s -> {outcome}")
     return stats
 
 
