@@ -706,6 +706,28 @@ async def _update_playback_progress(
         ))
 
 
+_live_push_tasks: set = set()
+
+
+def _schedule_live_emby_progress_push(user_id: int, media_id: int, progress_seconds: int, source: str) -> None:
+    """Hand a just-saved part-watched position to the Emby live push (fire and forget).
+
+    Never raises: this runs inside webhook handling, which must not fail because
+    of a push.
+    """
+    try:
+        import asyncio
+        from routers.sync import push_emby_progress_live
+
+        task = asyncio.get_running_loop().create_task(
+            push_emby_progress_live(user_id, media_id, progress_seconds, source)
+        )
+        _live_push_tasks.add(task)  # keep a reference so the task isn't garbage-collected mid-run
+        task.add_done_callback(_live_push_tasks.discard)
+    except Exception:
+        pass
+
+
 async def _write_watch_event(
     db: AsyncSession,
     user_id: int,
@@ -768,6 +790,8 @@ async def _write_watch_event(
     else:
         # Just update in-progress state, don't add to WatchEvent (History)
         await _update_playback_progress(db, user_id, media_id, progress_percent, progress_seconds)
+        if source and progress_seconds > 0 and 0.05 <= progress_percent < 0.90:
+            _schedule_live_emby_progress_push(user_id, media_id, progress_seconds, source)
         return True
 
 

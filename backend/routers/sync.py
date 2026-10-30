@@ -6783,6 +6783,87 @@ async def _lookup_emby_item_ids(db: AsyncSession, conn: MediaServerConnection, m
     return found
 
 
+_live_emby_push_inflight: set[tuple[int, int]] = set()
+
+
+async def push_emby_progress_live(user_id: int, media_id: int, progress_seconds: int, source: str | None) -> None:
+    """Push one just-recorded part-watched position to the user's Emby connection(s), right away.
+
+    Called (fire-and-forget) from the webhook that recorded the position, instead of
+    waiting for the scheduled push. Safeguards:
+    - never for events that came from Emby itself (that would echo straight back),
+    - only connections with Playback progress (push_playback) switched on,
+    - skipped when the Emby item is shared by several Scrob media rows (combined
+      multi-episode files), where one position can't be attributed to one row,
+    - emby.set_playback_position never touches played items and never lowers or
+      re-writes a position Emby already has, so repeats and echoes are no-ops,
+    - best effort: any failure is logged and the scheduled push remains the backstop.
+    """
+    if source in (None, "emby") or progress_seconds <= 0:
+        return
+    key = (user_id, media_id)
+    if key in _live_emby_push_inflight:
+        return
+    _live_emby_push_inflight.add(key)
+    try:
+        # Let the webhook's own transaction (new media rows, collection links) commit first.
+        await asyncio.sleep(2)
+        async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+        async with async_session() as db:
+            conns = (await db.execute(
+                select(MediaServerConnection).where(
+                    MediaServerConnection.user_id == user_id,
+                    MediaServerConnection.type == "emby",
+                    MediaServerConnection.push_playback.is_(True),
+                )
+            )).scalars().all()
+            for conn in conns:
+                sids = set((await db.execute(
+                    select(CollectionFile.source_id)
+                    .join(Collection, Collection.id == CollectionFile.collection_id)
+                    .where(
+                        Collection.user_id == user_id,
+                        Collection.media_id == media_id,
+                        CollectionFile.source == CollectionSource.emby,
+                        CollectionFile.connection_id == conn.id,
+                        CollectionFile.source_id.isnot(None),
+                    )
+                )).scalars().all())
+                if not sids:
+                    found = await _lookup_emby_item_ids(db, conn, [media_id])
+                    sids = {found[media_id]} if media_id in found else set()
+                if len(sids) != 1:
+                    print(f"Live Emby progress push for connection {conn.id}: media {media_id} not pushed ({len(sids)} Emby items matched)")
+                    continue
+                sid = next(iter(sids))
+                shared = (await db.execute(
+                    select(func.count(func.distinct(Collection.media_id)))
+                    .select_from(CollectionFile)
+                    .join(Collection, Collection.id == CollectionFile.collection_id)
+                    .where(
+                        Collection.user_id == user_id,
+                        CollectionFile.source == CollectionSource.emby,
+                        CollectionFile.connection_id == conn.id,
+                        CollectionFile.source_id == sid,
+                    )
+                )).scalar_one()
+                if shared > 1:
+                    print(f"Live Emby progress push for connection {conn.id}: Emby item {sid} is shared by {shared} Scrob rows, skipped")
+                    continue
+                info: dict = {}
+                outcome = await emby.set_playback_position(
+                    conn.url, conn.token, conn.server_user_id, sid, progress_seconds, info=info, played_at=utcnow(),
+                )
+                print(
+                    f"Live Emby progress push for connection {conn.id}: item {sid} scrob={progress_seconds}s "
+                    f"emby={info.get('emby_seconds', '?')}s from {source} -> {outcome}"
+                )
+    except Exception:
+        logger.exception("Live Emby progress push failed for media %s", media_id)
+    finally:
+        _live_emby_push_inflight.discard(key)
+
+
 async def _push_emby_playback_progress(db: AsyncSession, conn: MediaServerConnection, user_id: int) -> dict[str, int]:
     """Push Scrob's in-progress (part-watched) positions to an Emby connection.
 
