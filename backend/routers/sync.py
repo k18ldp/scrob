@@ -116,6 +116,9 @@ _PLEX_WATCHLIST_SLUG = "__plex_watchlist__"
 
 BATCH_SIZE = 500
 TMDB_CONCURRENCY = 5  # Max concurrent TMDB requests
+# Bulk enrichment of newly-imported media (tens of thousands on a first pull of a big
+# library). core.tmdb backs off on 429s, so a higher cap here is safe and several times faster.
+TMDB_ENRICH_CONCURRENCY = 12
 # asyncpg hard limit is 32767 parameters per query; stay well under it
 _MAX_IN_PARAMS = 30_000
 
@@ -512,7 +515,7 @@ async def batch_enrich_items(
     Movies: parallel /movie/{id} calls.
     Returns a list of warning dicts for seasons/items that couldn't be enriched.
     """
-    semaphore = asyncio.Semaphore(TMDB_CONCURRENCY)
+    semaphore = asyncio.Semaphore(TMDB_ENRICH_CONCURRENCY)
     if show_title_map is None:
         show_title_map = {}
 
@@ -520,9 +523,15 @@ async def batch_enrich_items(
     episodes = [(m, stid) for (m, stid) in items if m.media_type == MediaType.episode and stid]
 
     # ── Movies: parallel enrichment ──────────────────────────────────────────
+    movies_done = 0
+
     async def enrich_movie(media: Media):
+        nonlocal movies_done
         async with semaphore:
             await enrich_media(media, api_key=api_key)
+        movies_done += 1
+        if movies_done % 1000 == 0:
+            print(f"    Enriched {movies_done}/{len(movies)} movies...")
 
     if movies:
         await asyncio.gather(*[enrich_movie(m) for m in movies], return_exceptions=True)
@@ -2104,16 +2113,21 @@ async def sync_items(
     seen_source_ids: set[str] | None = None,  # accumulated across calls; every source_id encountered this run, used to prune deletions afterward
     push_back: dict[int, str] | None = None,  # accumulated across calls; media_id → source_id of newly collected items Scrob has watched but the server reports unwatched (#420)
 ) -> list[dict]:  # returns warnings
+    items_before_expansion = len(items)
     items = _expand_multi_episode_items(items, media_type, source)
     print(f"  Syncing {len(items)} {media_type.value}s from {source.value}...")
 
-    # Fix #497: multi-episode files have been expanded; update total_items to match
-    # the actual count sync_items will process, so the progress counter ends at 100%.
-    if job_id and source in (CollectionSource.jellyfin, CollectionSource.emby):
+    # Fix #497: multi-episode files have been expanded; grow total_items by the extra
+    # rows so the progress counter ends at 100%. Add the difference rather than
+    # overwriting the total: processed_items accumulates over every library in the run,
+    # so replacing the total with this one library's size made the counter overshoot
+    # (e.g. 63480 / 39471) whenever a server had more than one library.
+    extra_items = len(items) - items_before_expansion
+    if job_id and extra_items > 0 and source in (CollectionSource.jellyfin, CollectionSource.emby):
         await db.execute(
             update(SyncJob)
             .where(SyncJob.id == job_id)
-            .values(total_items=len(items))
+            .values(total_items=SyncJob.total_items + extra_items)
         )
         await db.commit()
 
