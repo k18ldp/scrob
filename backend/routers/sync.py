@@ -6738,6 +6738,71 @@ async def _save_push_state(db: AsyncSession, push_state: PushState, connection_i
         await db.rollback()
 
 
+async def _push_emby_playback_progress(db: AsyncSession, conn: MediaServerConnection, user_id: int) -> dict[str, int]:
+    """Push Scrob's in-progress (part-watched) positions to an Emby connection.
+
+    Only Emby, only items Scrob already knows the server item id for, and only
+    unfinished plays (>0s and under the 90% mark the webhooks treat as watched).
+    Server items shared by several local media rows (combined multi-episode
+    files) are skipped: one position can't be attributed to a single row.
+    emby.set_playback_position never touches played items and never moves an
+    Emby resume point backwards.
+    """
+    stats = {"pushed": 0, "skipped": 0, "failed": 0}
+    rows = (await db.execute(
+        select(PlaybackProgress.media_id, PlaybackProgress.progress_seconds)
+        .where(
+            PlaybackProgress.user_id == user_id,
+            PlaybackProgress.progress_seconds > 0,
+            PlaybackProgress.progress_percent > 0,
+            PlaybackProgress.progress_percent < 0.9,
+        )
+    )).all()
+    seconds_by_media = {media_id: seconds for media_id, seconds in rows}
+    if not seconds_by_media:
+        return stats
+
+    sids_by_media: dict[int, set[str]] = {}
+    media_ids = list(seconds_by_media)
+    for i in range(0, len(media_ids), _MAX_IN_PARAMS):
+        chunk = media_ids[i : i + _MAX_IN_PARAMS]
+        files = await db.execute(
+            select(CollectionFile.source_id, Collection.media_id)
+            .join(Collection, Collection.id == CollectionFile.collection_id)
+            .where(
+                Collection.user_id == user_id,
+                Collection.media_id.in_(chunk),
+                CollectionFile.source == CollectionSource.emby,
+                CollectionFile.connection_id == conn.id,
+                CollectionFile.source_id.isnot(None),
+            )
+        )
+        for source_id, media_id in files.all():
+            sids_by_media.setdefault(media_id, set()).add(source_id)
+
+    media_by_sid: dict[str, set[int]] = {}
+    for media_id, sids in sids_by_media.items():
+        for sid in sids:
+            media_by_sid.setdefault(sid, set()).add(media_id)
+
+    targets = [
+        (sid, seconds_by_media[next(iter(mids))])
+        for sid, mids in media_by_sid.items()
+        if len(mids) == 1
+    ]
+    stats["skipped"] += len(media_by_sid) - len(targets)
+
+    sem = asyncio.Semaphore(5)
+
+    async def _push_one(sid: str, seconds: int) -> str:
+        async with sem:
+            return await emby.set_playback_position(conn.url, conn.token, conn.server_user_id, sid, seconds)
+
+    for outcome in await asyncio.gather(*(_push_one(sid, seconds) for sid, seconds in targets)):
+        stats[outcome] = stats.get(outcome, 0) + 1
+    return stats
+
+
 async def _run_full_push(user_id: int, connection_id: int, job_id: int, incremental: bool = False) -> None:
     """Push Scrob's watched status/ratings/collection to one connection.
 
@@ -6804,6 +6869,16 @@ async def _run_full_push(user_id: int, connection_id: int, job_id: int, incremen
             push_plan = await plan_push(db, conn.id, incremental=incremental)
             push_mode = push_plan.mode
             push_state = await PushState.load(db, conn.id, push_plan)
+
+            if conn.type == "emby" and conn.push_playback:
+                await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(current_step="Pushing playback progress"))
+                await db.commit()
+                try:
+                    progress_stats = await _push_emby_playback_progress(db, conn, user_id)
+                    logger.info("Emby playback progress push for connection %s: %s", connection_id, progress_stats)
+                except Exception:
+                    # Best effort: a progress failure must not fail the watched/ratings push.
+                    logger.exception("Emby playback progress push failed for connection %s", connection_id)
 
             if conn.type == "nuvio":
                 settings_result = await db.execute(
