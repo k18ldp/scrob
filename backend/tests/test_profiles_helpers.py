@@ -1,10 +1,11 @@
 import json
 import unittest
+from types import SimpleNamespace
 
 import httpx
 
 from core import emby
-from core.profile_names import unique_username
+from core.profile_names import pick_linked_connection, unique_username
 
 
 class UniqueUsernameTests(unittest.TestCase):
@@ -21,6 +22,31 @@ class UniqueUsernameTests(unittest.TestCase):
 
     def test_long_names_are_cut(self) -> None:
         self.assertEqual(len(unique_username("x" * 200, set())), 60)
+
+
+class PickLinkedConnectionTests(unittest.TestCase):
+    @staticmethod
+    def _c(cid: int, url: str, uid: str | None) -> SimpleNamespace:
+        return SimpleNamespace(id=cid, url=url, server_user_id=uid)
+
+    def test_routes_by_user_id_on_the_same_server(self) -> None:
+        a = self._c(1, "https://emby.example/", "aaaa1111")
+        b = self._c(2, "https://emby.example", "bbbb2222")
+        c = self._c(3, "https://other.example", "bbbb2222")  # same user id, different server
+        self.assertIs(pick_linked_connection([a, c, b], "https://EMBY.example/", "bbbb2222"), b)
+
+    def test_dashes_and_case_in_ids_do_not_matter(self) -> None:
+        a = self._c(1, "http://e", "0123456789ABCDEF0123456789ABCDEF")
+        self.assertIs(pick_linked_connection([a], "http://e", "01234567-89ab-cdef-0123-456789abcdef"), a)
+
+    def test_unknown_or_missing_user_matches_nothing(self) -> None:
+        a = self._c(1, "http://e", "aaaa")
+        self.assertIsNone(pick_linked_connection([a], "http://e", "zzzz"))
+        self.assertIsNone(pick_linked_connection([a], "http://e", None))
+        self.assertIsNone(pick_linked_connection([a], "http://e", ""))
+
+    def test_connection_without_a_stored_user_never_matches(self) -> None:
+        self.assertIsNone(pick_linked_connection([self._c(1, "http://e", None)], "http://e", "aaaa"))
 
 
 class ListUsersTests(unittest.IsolatedAsyncioTestCase):

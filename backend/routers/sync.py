@@ -6786,12 +6786,16 @@ async def _lookup_emby_item_ids(db: AsyncSession, conn: MediaServerConnection, m
 _live_emby_push_inflight: set[tuple[int, int]] = set()
 
 
-async def push_emby_progress_live(user_id: int, media_id: int, progress_seconds: int, source: str | None) -> None:
+async def push_emby_progress_live(
+    user_id: int, media_id: int, progress_seconds: int, source: str | None, source_connection_id: int | None = None
+) -> None:
     """Push one just-recorded part-watched position to the user's Emby connection(s), right away.
 
     Called (fire-and-forget) from the webhook that recorded the position, instead of
     waiting for the scheduled push. Safeguards:
-    - never for events that came from Emby itself (that would echo straight back),
+    - never back to the Emby connection the event came from (that would echo straight
+      back); other Emby connections of the same user (a second server) are pushed to.
+      An Emby event that doesn't say which connection raised it is skipped entirely,
     - only connections with Playback progress (push_playback) switched on,
     - skipped when the Emby item is shared by several Scrob media rows (combined
       multi-episode files), where one position can't be attributed to one row,
@@ -6799,7 +6803,9 @@ async def push_emby_progress_live(user_id: int, media_id: int, progress_seconds:
       re-writes a position Emby already has, so repeats and echoes are no-ops,
     - best effort: any failure is logged and the scheduled push remains the backstop.
     """
-    if source in (None, "emby") or progress_seconds <= 0:
+    if source is None or progress_seconds <= 0:
+        return
+    if source == "emby" and source_connection_id is None:
         return
     key = (user_id, media_id)
     if key in _live_emby_push_inflight:
@@ -6818,6 +6824,8 @@ async def push_emby_progress_live(user_id: int, media_id: int, progress_seconds:
                 )
             )).scalars().all()
             for conn in conns:
+                if source == "emby" and conn.id == source_connection_id:
+                    continue
                 sids = set((await db.execute(
                     select(CollectionFile.source_id)
                     .join(Collection, Collection.id == CollectionFile.collection_id)

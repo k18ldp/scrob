@@ -16,7 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core import emby
-from core.profile_names import unique_username
+from core.profile_names import same_server, unique_username
 from core.security import create_access_token, session_lifetime
 from db import get_db
 from dependencies import get_current_user
@@ -78,8 +78,7 @@ async def _create_profile(db: AsyncSession, owner: User, name: str) -> User:
     return profile
 
 
-def _same_server(a: str, b: str) -> bool:
-    return (a or "").rstrip("/").lower() == (b or "").rstrip("/").lower()
+_same_server = same_server
 
 
 class ProfileCreate(BaseModel):
@@ -128,6 +127,7 @@ async def list_profiles(db: AsyncSession = Depends(get_db), current_user: User =
     return {
         "managed": False,
         "owner_id": current_user.id,
+        "owner_api_key": current_user.api_key,
         "username": current_user.username,
         "profiles": await _profile_payload(db, list(profiles)),
     }

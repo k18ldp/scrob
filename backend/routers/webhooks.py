@@ -43,6 +43,7 @@ from core import simkl as simkl_client
 from core import mdblist as mdblist_client
 from core import tvdb as tvdb_client
 from core.jellyfin import extract_quality
+from core.profile_names import pick_linked_connection
 from core.translations import get_user_metadata_language
 from core.timeutil import utcnow
 
@@ -709,7 +710,9 @@ async def _update_playback_progress(
 _live_push_tasks: set = set()
 
 
-def _schedule_live_emby_progress_push(user_id: int, media_id: int, progress_seconds: int, source: str) -> None:
+def _schedule_live_emby_progress_push(
+    user_id: int, media_id: int, progress_seconds: int, source: str, source_connection_id: int | None = None
+) -> None:
     """Hand a just-saved part-watched position to the Emby live push (fire and forget).
 
     Never raises: this runs inside webhook handling, which must not fail because
@@ -720,7 +723,7 @@ def _schedule_live_emby_progress_push(user_id: int, media_id: int, progress_seco
         from routers.sync import push_emby_progress_live
 
         task = asyncio.get_running_loop().create_task(
-            push_emby_progress_live(user_id, media_id, progress_seconds, source)
+            push_emby_progress_live(user_id, media_id, progress_seconds, source, source_connection_id)
         )
         _live_push_tasks.add(task)  # keep a reference so the task isn't garbage-collected mid-run
         task.add_done_callback(_live_push_tasks.discard)
@@ -737,6 +740,7 @@ async def _write_watch_event(
     completed: bool,
     window_minutes: int = DEFAULT_DEDUP_WINDOW_MINUTES,
     source: str | None = None,
+    source_connection_id: int | None = None,
 ) -> bool:
     """Returns False only when this call was consumed as a push-watched echo
     (see the _recently_pushed_watched comment above) - True in every other
@@ -791,7 +795,7 @@ async def _write_watch_event(
         # Just update in-progress state, don't add to WatchEvent (History)
         await _update_playback_progress(db, user_id, media_id, progress_percent, progress_seconds)
         if source and progress_seconds > 0 and 0.05 <= progress_percent < 0.90:
-            _schedule_live_emby_progress_push(user_id, media_id, progress_seconds, source)
+            _schedule_live_emby_progress_push(user_id, media_id, progress_seconds, source, source_connection_id)
         return True
 
 
@@ -917,7 +921,7 @@ def parse_jellyfin_payload(payload: dict) -> dict | None:
             "is_paused": bool(play_state.get("IsPaused", False)),
             "session_id": session.get("Id") or session.get("PlaySessionId"),
             "username": session.get("UserName") or payload.get("NotificationUsername", ""),
-            "server_user_id": session.get("UserId") or payload.get("UserId"),
+            "server_user_id": session.get("UserId") or payload.get("UserId") or (payload.get("User") or {}).get("Id"),
             "quality": quality,
             # Authoritative "finished the item" signal for a stop event - trusted
             # over the computed position ratio above, which the auto-play race
@@ -1789,7 +1793,10 @@ async def _handle_emby_webhook(request: Request, db: AsyncSession, api_key: str,
             progress_percent = 1.0
         if (not conn or conn.sync_watched) and progress_percent > 0.05:
             for m in media_list:
-                await _write_watch_event(db, user.id, m.id, progress_percent, progress_seconds, progress_percent >= 0.90, window_minutes, source="emby")
+                await _write_watch_event(
+                    db, user.id, m.id, progress_percent, progress_seconds, progress_percent >= 0.90, window_minutes,
+                    source="emby", source_connection_id=conn.id if conn else None,
+                )
         await db.commit()
         for m in media_list:
             await _maybe_trakt_scrobble(settings, m, "stop", progress_percent, db=db)
@@ -2069,6 +2076,66 @@ async def emby_webhook_connection(
     api_key: str = Query(..., description="Scrob user API key"),
 ):
     return await _handle_emby_webhook(request, db, api_key, connection_id)
+
+
+@router.post("/emby/household/{connection_id}")
+async def emby_household_webhook(
+    connection_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Query(..., description="Household owner's Scrob API key"),
+):
+    """One webhook URL for a whole Emby server shared by several managed profiles.
+
+    ``connection_id`` is any of the owner's Emby connections on that server (it
+    only identifies the server). Each event is routed to the profile whose
+    connection on that server is linked to the Emby user who raised it, then
+    handled exactly like that profile's own per-connection webhook. Events from
+    Emby users nobody is linked to are ignored, so they never leak into anyone's
+    history. Only the owner's key works here - a profile's own key cannot be
+    used to reach other profiles.
+    """
+    owner = (await db.execute(select(User).where(User.api_key == api_key))).scalar_one_or_none()
+    if not owner:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    if owner.managed_by_user_id is not None:
+        raise HTTPException(status_code=403, detail="Use the household owner's API key for this URL")
+
+    # Read the body first so Starlette caches it for the handler below.
+    if not await request.body():
+        return {"status": "ignored", "reason": "empty body"}
+    try:
+        if request.headers.get("content-type", "").startswith("multipart/form-data"):
+            raw = (await request.form()).get("data")
+            payload = json.loads(raw) if raw else None
+        else:
+            payload = await request.json()
+    except Exception:
+        payload = None
+    data = parse_jellyfin_payload(payload) if isinstance(payload, dict) else None
+    if not data:
+        return {"status": "ignored"}
+
+    anchor = await _get_connection_by_id(db, owner.id, connection_id)
+    if anchor is None or anchor.type != "emby":
+        raise HTTPException(status_code=404, detail="Emby connection not found")
+
+    owned_ids = [owner.id] + list((await db.execute(
+        select(User.id).where(User.managed_by_user_id == owner.id)
+    )).scalars().all())
+    candidates = (await db.execute(
+        select(MediaServerConnection)
+        .where(MediaServerConnection.user_id.in_(owned_ids), MediaServerConnection.type == "emby")
+        .order_by(MediaServerConnection.id)
+    )).scalars().all()
+    target = pick_linked_connection(candidates, anchor.url, data.get("server_user_id"))
+    if target is None:
+        return {"status": "ignored", "reason": "no profile is linked to this Emby user"}
+
+    target_user = (await db.execute(select(User).where(User.id == target.user_id))).scalar_one_or_none()
+    if target_user is None:
+        return {"status": "ignored", "reason": "profile not found"}
+    return await _handle_emby_webhook(request, db, target_user.api_key, target.id)
 
 
 # ── Plex ───────────────────────────────────────────────────────────────────────

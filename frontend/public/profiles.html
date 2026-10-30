@@ -156,13 +156,30 @@
     var select = el("select", {});
     var results = el("div", {});
     var loadBtn = el("button", { disabled: "disabled" }, "Load users");
-    box.append(el("div", { class: "row" }, select, loadBtn), results);
+    var hookUrl = el("input", { type: "text", readonly: "readonly", style: "width:100%" });
+    var hookBox = el("div", { style: "display:none; margin-top:12px" },
+      el("div", { class: "name" }, "One webhook URL for this Emby server"),
+      el("p", { class: "muted" }, "Put this single URL in the Emby webhook settings instead of one per person. Each play goes to the profile linked to the Emby user who played it; plays by anyone not linked are ignored. It contains your own API key, so don't share it, and use an https address if the server isn't on your home network."),
+      hookUrl);
+    box.append(el("div", { class: "row" }, select, loadBtn), hookBox, results);
+
+    function showHook() {
+      var opt = select.options[select.selectedIndex];
+      if (!opt || opt.getAttribute("data-type") !== "emby" || !data.owner_api_key) { hookBox.style.display = "none"; return; }
+      hookUrl.value = window.location.origin + "/api/proxy/webhooks/emby/household/" + opt.value +
+        "?api_key=" + encodeURIComponent(data.owner_api_key);
+      hookBox.style.display = "";
+    }
+    select.addEventListener("change", showHook);
 
     api("/auth/connections").then(function (conns) {
       var servers = conns.filter(function (c) { return c.type === "emby" || c.type === "jellyfin"; });
       if (!servers.length) { select.append(el("option", { value: "" }, "No Emby/Jellyfin connections")); return; }
-      servers.forEach(function (c) { select.append(el("option", { value: String(c.id) }, c.name + " - " + c.url)); });
+      servers.forEach(function (c) {
+        select.append(el("option", { value: String(c.id), "data-type": c.type }, c.name + " - " + c.url));
+      });
       loadBtn.removeAttribute("disabled");
+      showHook();
     }).catch(function (e) { say(e.message, "err"); });
 
     loadBtn.addEventListener("click", function () {
