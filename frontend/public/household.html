@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Household - Scrob</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #09090b; color: #f4f4f5; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 20px 16px 72px; }
+  a { color: #93c5fd; }
+  h1 { font-size: 30px; margin: 4px 0 2px; }
+  .muted { color: #a1a1aa; font-size: 13px; }
+  .top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .between { justify-content: space-between; }
+  button, input, select { font: inherit; color: inherit; background: #1f1f23; border: 1px solid #3f3f46; border-radius: 10px; padding: 7px 12px; }
+  button { cursor: pointer; font-weight: 600; font-size: 13px; }
+  button:hover:not(:disabled) { background: #2d2d33; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: #3b5bdb; border-color: #3b5bdb; }
+  button.primary:hover:not(:disabled) { background: #4c6ef5; }
+  button.small { padding: 4px 9px; font-size: 12px; }
+  button.danger { color: #fca5a5; }
+  input[type=text] { min-width: 0; flex: 1; }
+  #status { min-height: 22px; margin: 6px 0 10px; font-size: 14px; }
+  #status.err { color: #fca5a5; }
+  #status.ok { color: #86efac; }
+  .person { background: #18181b; border: 1px solid #27272a; border-radius: 16px; padding: 14px; margin-bottom: 12px; }
+  .avatar { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 700; color: #fff; flex: none; }
+  .pname { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; min-width: 0; }
+  .pname span.t { overflow: hidden; text-overflow: ellipsis; }
+  .key { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #d4d4d8; word-break: break-all; }
+  .conn { border-top: 1px solid #27272a; padding: 10px 0; margin-top: 10px; }
+  .cname { font-weight: 600; }
+  .chip { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid #3f3f46; color: #a1a1aa; white-space: nowrap; }
+  .chip.ok { color: #4ade80; border-color: #14532d; background: #0b2a17; }
+  .chip.busy { color: #fbbf24; border-color: #78350f; background: #2a1d08; }
+  .chip.bad { color: #f87171; border-color: #7f1d1d; background: #2a0b0b; }
+  .bar { height: 6px; border-radius: 6px; background: #27272a; margin: 8px 0 3px; overflow: hidden; }
+  .bar b { display: block; height: 100%; background: #3b5bdb; }
+  .foot { display: flex; gap: 8px; flex-wrap: wrap; border-top: 1px solid #27272a; padding-top: 10px; margin-top: 10px; }
+  .box { background: #18181b; border: 1px dashed #3f3f46; border-radius: 14px; padding: 12px; margin-top: 16px; }
+  .box input[type=text] { width: 100%; font-family: ui-monospace, Menlo, monospace; font-size: 11px; margin: 6px 0; }
+  .err { color: #fca5a5; font-size: 12px; margin-top: 4px; word-break: break-word; }
+</style>
+</head>
+<body>
+<main>
+  <div class="top">
+    <a href="/">&larr; Back to Scrob</a>
+  </div>
+  <h1>Household</h1>
+  <div class="muted" id="summary"></div>
+  <div id="status"></div>
+  <div id="app">Loading...</div>
+</main>
+<script>
+(function () {
+  "use strict";
+  var app = document.getElementById("app");
+  var statusEl = document.getElementById("status");
+  var summaryEl = document.getElementById("summary");
+  var COLOURS = ["#7c3aed", "#0ea5e9", "#f97316", "#10b981", "#ec4899", "#eab308"];
+  var data = null;
+  var shownKeys = {};      // person id -> true while their Silo key is revealed
+  var linkers = {};        // "personId|serverUrl" -> { users: [...] | null, loading: bool }
+  var timer = null;
+
+  function el(tag, props) {
+    var e = document.createElement(tag);
+    props = props || {};
+    Object.keys(props).forEach(function (k) {
+      var v = props[k];
+      if (v === null || v === undefined || v === false) return;
+      if (k === "class") e.className = v;
+      else if (k.indexOf("on") === 0) e.addEventListener(k.slice(2), v);
+      else e.setAttribute(k, v);
+    });
+    for (var i = 2; i < arguments.length; i++) {
+      var kid = arguments[i];
+      if (kid !== null && kid !== undefined) e.append(kid);
+    }
+    return e;
+  }
+  function say(msg, kind) { statusEl.textContent = msg || ""; statusEl.className = kind || ""; }
+
+  function api(path, opts) {
+    opts = opts || {};
+    var init = { method: opts.method || "GET", credentials: "same-origin", headers: {} };
+    if (opts.body !== undefined) { init.body = JSON.stringify(opts.body); init.headers["Content-Type"] = "application/json"; }
+    return fetch("/api/proxy" + path, init).then(function (r) {
+      if (r.status === 401) { window.location.href = "/login"; throw new Error("Please sign in"); }
+      if (!r.ok) {
+        return r.json().catch(function () { return {}; }).then(function (d) {
+          var e = new Error(typeof d.detail === "string" ? d.detail : (r.statusText || ("HTTP " + r.status)));
+          e.status = r.status;
+          throw e;
+        });
+      }
+      return r.json();
+    });
+  }
+
+  function postForm(action, fields) {
+    var f = el("form", { method: "POST", action: action });
+    Object.keys(fields).forEach(function (k) { f.append(el("input", { type: "hidden", name: k, value: String(fields[k]) })); });
+    document.body.append(f);
+    f.submit();
+  }
+
+  function sameServer(a, b) { return String(a || "").replace(/\/+$/, "").toLowerCase() === String(b || "").replace(/\/+$/, "").toLowerCase(); }
+
+  function ago(iso) {
+    if (!iso) return "";
+    var t = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(iso) ? iso : iso + "Z");
+    if (isNaN(t)) return "";
+    var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.round(s / 60) + " min ago";
+    if (s < 86400) return Math.round(s / 3600) + " h ago";
+    return Math.round(s / 86400) + " d ago";
+  }
+
+  function copy(text, label) {
+    var done = function () { say(label + " copied", "ok"); };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done, function () { window.prompt("Copy this:", text); });
+    } else {
+      window.prompt("Copy this:", text);
+    }
+  }
+
+  function anyActive() {
+    return data && data.people.some(function (p) {
+      return p.connections.some(function (c) {
+        return (c.pull && c.pull.latest && c.pull.latest.active) || (c.push && c.push.latest && c.push.latest.active);
+      });
+    });
+  }
+  function pickerOpen() { return Object.keys(linkers).length > 0; }
+
+  function schedule() {
+    clearTimeout(timer);
+    timer = setTimeout(function () { load(true); }, anyActive() ? 4000 : 30000);
+  }
+
+  function load(quiet) {
+    return api("/profiles/overview").then(function (d) {
+      data = d;
+      if (!(quiet && pickerOpen())) render();
+      schedule();
+    }).catch(function (e) {
+      if (e.status === 403) { renderManaged(); return; }
+      if (!quiet) { app.textContent = ""; say(e.message, "err"); }
+      schedule();
+    });
+  }
+
+  function renderManaged() {
+    summaryEl.textContent = "";
+    app.textContent = "";
+    app.append(el("div", { class: "person" },
+      el("p", {}, "You are viewing Scrob as a household profile. Switch back to your own account to manage everyone."),
+      el("button", { class: "primary", onclick: function () { postForm("/profile-switch", { back: 1, next: "/household.html" }); } }, "Back to my account")));
+  }
+
+  // ----- connection rows -------------------------------------------------
+
+  function jobState(job, verbs) {
+    // returns { chip, cls, bar, text } for one pull/push slot
+    var latest = job && job.latest;
+    if (latest && latest.active) {
+      var queued = latest.status === "pending";
+      var pct = latest.total > 0 ? Math.min(100, Math.round(100 * latest.processed / latest.total)) : null;
+      return {
+        chip: queued ? "Queued" : verbs.ing, cls: "busy",
+        bar: queued || latest.processed > latest.total ? null : pct,
+        text: queued ? "Waiting for its turn" : ((latest.step || verbs.ing) + (latest.total > 0 && latest.processed <= latest.total ? " - " + latest.processed + " / " + latest.total : "")),
+      };
+    }
+    if (latest && latest.status === "failed") return { chip: verbs.fail, cls: "bad", err: latest.error || "Failed", text: "" };
+    if (job && job.last_ok_at) return { chip: verbs.done + " " + ago(job.last_ok_at), cls: "ok", text: "" };
+    return { chip: verbs.never, cls: "", text: "" };
+  }
+
+  function connRow(person, c) {
+    var pull = jobState(c.pull, { ing: "Pulling", fail: "Pull failed", done: "Pulled", never: "Never pulled" });
+    var push = c.push_enabled ? jobState(c.push, { ing: "Pushing", fail: "Push failed", done: "Pushed", never: "Never pushed" }) : null;
+    var busy = (c.pull && c.pull.latest && c.pull.latest.active) || (c.push && c.push.latest && c.push.latest.active);
+
+    var row = el("div", { class: "conn" },
+      el("div", { class: "row between" },
+        el("span", { class: "cname" }, c.name + (c.server_username ? " (" + c.server_username + ")" : "")),
+        el("span", { class: "chip " + pull.cls }, pull.chip)));
+    if (push) row.append(el("div", { class: "row between", style: "margin-top:4px" },
+      el("span", { class: "muted" }, "Scrob → server"), el("span", { class: "chip " + push.cls }, push.chip)));
+    [pull, push].forEach(function (s) {
+      if (!s) return;
+      if (s.bar !== null && s.bar !== undefined) row.append(el("div", { class: "bar" }, el("b", { style: "width:" + s.bar + "%" })));
+      if (s.text) row.append(el("div", { class: "muted" }, s.text));
+      if (s.err) row.append(el("div", { class: "err" }, s.err));
+    });
+
+    var actions = el("div", { class: "row", style: "margin-top:8px" },
+      el("button", { class: "small", disabled: busy ? "disabled" : null, onclick: function () { run("/profiles/connections/" + c.id + "/pull", "Pull queued"); } }, "Pull"));
+    if (c.push_enabled) actions.append(el("button", { class: "small", disabled: busy ? "disabled" : null, onclick: function () { run("/profiles/connections/" + c.id + "/push", "Push queued"); } }, "Push"));
+    row.append(actions);
+    return row;
+  }
+
+  function run(path, okMsg) {
+    say("");
+    api(path, { method: "POST" }).then(function (r) {
+      var msg = r.status === "already running" ? "Already running" : okMsg;
+      if (r.results) {
+        var started = r.started || 0;
+        msg = started ? (started + " queued - they run one after another") : "Nothing to start (already running or nothing enabled)";
+      }
+      say(msg, "ok");
+      return load(true);
+    }).catch(function (e) { say(e.message, "err"); });
+  }
+
+  // ----- linking a person to a user on a server --------------------------
+
+  function serverAnchors() {
+    // One entry per distinct Emby/Jellyfin server the owner is connected to.
+    var owner = data.people[0];
+    var seen = [];
+    owner.connections.forEach(function (c) {
+      if ((c.type === "emby" || c.type === "jellyfin") && !seen.some(function (a) { return sameServer(a.url, c.url); })) seen.push(c);
+    });
+    return seen;
+  }
+
+  function linkRow(person, anchor) {
+    var key = person.id + "|" + anchor.url;
+    var st = linkers[key];
+    var row = el("div", { class: "conn" },
+      el("div", { class: "row between" }, el("span", { class: "cname" }, anchor.name), el("span", { class: "chip" }, "Not linked")));
+    if (!st) {
+      row.append(el("div", { class: "row", style: "margin-top:8px" },
+        el("button", { class: "small primary", onclick: function () {
+          linkers[key] = { users: null };
+          render();
+          api("/profiles/server-users?connection_id=" + anchor.id).then(function (users) {
+            linkers[key].users = users.filter(function (u) { return !u.linked_profile_id; });
+            render();
+          }).catch(function (e) { delete linkers[key]; say(e.message, "err"); render(); });
+        } }, "Link to a user on " + anchor.name)));
+      return row;
+    }
+    if (!st.users) { row.append(el("div", { class: "muted" }, "Loading users...")); return row; }
+    if (!st.users.length) {
+      row.append(el("div", { class: "muted" }, "Every user on this server is already linked."));
+      row.append(el("button", { class: "small", onclick: function () { delete linkers[key]; render(); } }, "Close"));
+      return row;
+    }
+    var sel = el("select", {}, el("option", { value: "" }, "Choose a user..."));
+    st.users.forEach(function (u) { sel.append(el("option", { value: u.id }, u.name || u.id)); });
+    row.append(el("div", { class: "row", style: "margin-top:8px" }, sel,
+      el("button", { class: "small primary", onclick: function () {
+        var u = st.users.filter(function (x) { return x.id === sel.value; })[0];
+        if (!u) { say("Choose a user first.", "err"); return; }
+        api("/profiles/import-server-users", { method: "POST", body: { connection_id: anchor.id, people: [{ emby_user_id: u.id, emby_username: u.name, profile_id: person.id }] } })
+          .then(function () { delete linkers[key]; say("Linked " + person.username + " to " + (u.name || u.id) + ". Now pull their history.", "ok"); return load(true); })
+          .catch(function (e) { say(e.message, "err"); });
+      } }, "Link"),
+      el("button", { class: "small", onclick: function () { delete linkers[key]; render(); } }, "Cancel")));
+    return row;
+  }
+
+  // ----- page ------------------------------------------------------------
+
+  function personCard(person, index) {
+    var card = el("div", { class: "person" });
+    var shown = !!shownKeys[person.id];
+    card.append(el("div", { class: "row between" },
+      el("div", { class: "pname" }, el("span", { class: "avatar", style: "background:" + COLOURS[index % COLOURS.length] }, (person.username || "?").charAt(0).toUpperCase()),
+        el("span", { class: "t" }, person.is_owner ? person.username + " (you)" : person.username)),
+      el("div", { class: "row" },
+        el("button", { class: "small", onclick: function () { shownKeys[person.id] = !shownKeys[person.id]; render(); } }, shown ? "Hide Silo key" : "Show Silo key"),
+        el("button", { class: "small", onclick: function () { copy(person.api_key, "Silo key"); } }, "Copy key"))));
+    if (shown) card.append(el("div", { class: "key", style: "margin-top:8px" }, person.api_key));
+
+    person.connections.forEach(function (c) { card.append(connRow(person, c)); });
+    serverAnchors().forEach(function (a) {
+      var linked = person.connections.some(function (c) { return c.type === a.type && sameServer(c.url, a.url); });
+      if (!linked) card.append(linkRow(person, a));
+    });
+    if (!person.connections.length && !serverAnchors().length) {
+      card.append(el("div", { class: "muted", style: "margin-top:10px" }, "No server connections yet."));
+    }
+
+    var foot = el("div", { class: "foot" });
+    if (person.is_owner) {
+      foot.append(el("a", { href: "/connections" }, "Connections & settings"));
+    } else {
+      foot.append(el("button", { class: "small", onclick: function () { postForm("/profile-switch", { profile_id: person.id, next: "/" }); } }, "Open as " + person.username));
+      foot.append(el("button", { class: "small", onclick: function () { postForm("/profile-switch", { profile_id: person.id, next: "/connections" }); } }, "Connection settings"));
+    }
+    card.append(foot);
+    return card;
+  }
+
+  function render() {
+    if (!data) return;
+    var conns = 0;
+    data.people.forEach(function (p) { conns += p.connections.length; });
+    summaryEl.textContent = data.people.length + (data.people.length === 1 ? " person" : " people") + " · " + conns + " connection" + (conns === 1 ? "" : "s");
+    app.textContent = "";
+
+    var nameInput = el("input", { type: "text", placeholder: "Name of new person", maxlength: "60", style: "display:none" });
+    var addBtn = el("button", { onclick: function () {
+      if (nameInput.style.display === "none") { nameInput.style.display = ""; nameInput.focus(); return; }
+      var name = nameInput.value.trim();
+      if (!name) return;
+      api("/profiles", { method: "POST", body: { name: name } })
+        .then(function () { say("Added " + name, "ok"); return load(true); })
+        .catch(function (e) { say(e.message, "err"); });
+    } }, "+ Add person");
+    app.append(el("div", { class: "row", style: "margin: 10px 0 14px" },
+      el("button", { class: "primary", onclick: function () { run("/profiles/pull-all", ""); } }, "Pull all"),
+      el("button", { onclick: function () { run("/profiles/push-all", ""); } }, "Push all"),
+      addBtn, nameInput));
+
+    data.people.forEach(function (p, i) { app.append(personCard(p, i)); });
+
+    var embys = serverAnchors().filter(function (a) { return a.type === "emby"; });
+    if (embys.length) {
+      var hooks = el("div", { class: "box" },
+        el("div", { class: "cname" }, "Webhook URLs"),
+        el("div", { class: "muted" }, "One per Emby server. Paste it into that server's webhook settings; each play goes to the person linked to the Emby user who played it. It contains your own API key - keep it private, and use an https address for a server that isn't on your home network."));
+      embys.forEach(function (a) {
+        var url = window.location.origin + "/api/proxy/webhooks/emby/household/" + a.id + "?api_key=" + encodeURIComponent(data.owner_api_key);
+        hooks.append(el("div", { style: "margin-top:10px" }, el("div", { class: "muted" }, a.name),
+          el("input", { type: "text", readonly: "readonly", value: url }),
+          el("button", { class: "small", onclick: function () { copy(url, "Webhook URL for " + a.name); } }, "Copy")));
+      });
+      app.append(hooks);
+    }
+
+    app.append(el("p", { class: "muted", style: "margin-top:18px" }, "Need to rename or delete someone, or import several users at once? Use the ",
+      el("a", { href: "/profiles.html" }, "profiles page"), "."));
+  }
+
+  load(false);
+})();
+</script>
+</body>
+</html>

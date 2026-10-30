@@ -5,10 +5,13 @@ import type { APIRoute } from "astro";
 // httpOnly cookie, so the swap has to happen server side.
 //   POST profile_id=<id>  -> sign in as that managed profile
 //   POST back=1           -> return to the owner's own account
+// Either may add next=<path> to land on one of a few fixed pages afterwards.
 const BACKEND_PORT = (import.meta.env.BACKEND_PORT as string | undefined) ?? "7331";
 const BACKEND = `http://localhost:${BACKEND_PORT}`;
 const OWNER_COOKIE = "owner_token";
 const WEEK = 60 * 60 * 24 * 7;
+// Only these destinations are honoured, so the form can't be used as an open redirect.
+const NEXT_PAGES = new Set(["/", "/connections", "/history", "/movies", "/shows", "/household.html", "/profiles.html"]);
 
 export const POST: APIRoute = async ({ request, cookies, url, redirect }) => {
   // Same-origin only: this endpoint replaces the login cookie.
@@ -27,6 +30,8 @@ export const POST: APIRoute = async ({ request, cookies, url, redirect }) => {
   const secure = url.protocol === "https:" || request.headers.get("x-forwarded-proto") === "https";
   const cookieOpts = { path: "/", httpOnly: true, sameSite: "lax" as const, secure };
   const form = await request.formData();
+  const nextParam = String(form.get("next") ?? "/");
+  const next = NEXT_PAGES.has(nextParam) ? nextParam : "/";
   const current = cookies.get("token")?.value;
   const owner = cookies.get(OWNER_COOKIE)?.value;
 
@@ -35,7 +40,7 @@ export const POST: APIRoute = async ({ request, cookies, url, redirect }) => {
       cookies.set("token", owner, { ...cookieOpts, maxAge: WEEK });
       cookies.delete(OWNER_COOKIE, { path: "/" });
     }
-    return redirect("/", 303);
+    return redirect(next, 303);
   }
 
   const id = Number(form.get("profile_id"));
@@ -60,5 +65,5 @@ export const POST: APIRoute = async ({ request, cookies, url, redirect }) => {
   const data = (await res.json()) as { access_token: string; expires_in: number };
   cookies.set(OWNER_COOKIE, ownerToken, { ...cookieOpts, maxAge: WEEK });
   cookies.set("token", data.access_token, { ...cookieOpts, maxAge: data.expires_in });
-  return redirect("/", 303);
+  return redirect(next, 303);
 };

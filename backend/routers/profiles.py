@@ -10,18 +10,21 @@ import logging
 import secrets
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core import emby
+from core.household import is_active, summarise_jobs
 from core.profile_names import same_server, unique_username
 from core.security import create_access_token, session_lifetime
+from core.timeutil import utcnow
 from db import get_db
 from dependencies import get_current_user
 from models.base import UserRole
 from models.connections import MediaServerConnection
+from models.sync import SyncJob, SyncStatus
 from models.users import User, UserSettings
 
 logger = logging.getLogger("uvicorn.error")
@@ -131,6 +134,190 @@ async def list_profiles(db: AsyncSession = Depends(get_db), current_user: User =
         "username": current_user.username,
         "profiles": await _profile_payload(db, list(profiles)),
     }
+
+
+async def _household_people(db: AsyncSession, owner: User) -> list[User]:
+    """The owner first, then every managed profile in creation order."""
+    managed = (await db.execute(
+        select(User).where(User.managed_by_user_id == owner.id).order_by(User.id)
+    )).scalars().all()
+    return [owner, *managed]
+
+
+@router.get("/overview")
+async def household_overview(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Everyone in the household with their server connections and what each pull/push is doing."""
+    _require_owner(current_user)
+    people = await _household_people(db, current_user)
+    conns = (await db.execute(
+        select(MediaServerConnection)
+        .where(MediaServerConnection.user_id.in_([p.id for p in people]))
+        .order_by(MediaServerConnection.id)
+    )).scalars().all()
+    jobs = []
+    if conns:
+        jobs = (await db.execute(
+            select(SyncJob)
+            .where(SyncJob.connection_id.in_([c.id for c in conns]))
+            .order_by(SyncJob.created_at.desc(), SyncJob.id.desc())
+            .limit(2000)
+        )).scalars().all()
+    summary = summarise_jobs(jobs, utcnow())
+
+    by_user: dict[int, list[dict]] = {p.id: [] for p in people}
+    for c in conns:
+        job_info = summary.get(c.id, {})
+        by_user[c.user_id].append({
+            "id": c.id,
+            "name": c.name,
+            "type": c.type,
+            "url": c.url,
+            "server_username": c.server_username,
+            "push_enabled": c.push_enabled,
+            "pull": job_info.get("pull"),
+            "push": job_info.get("push"),
+        })
+    return {
+        "owner_id": current_user.id,
+        "owner_api_key": current_user.api_key,
+        "people": [
+            {
+                "id": p.id,
+                "username": p.username,
+                "is_owner": p.id == current_user.id,
+                "api_key": p.api_key,
+                "connections": by_user[p.id],
+            }
+            for p in people
+        ],
+    }
+
+
+async def _household_connection(db: AsyncSession, owner: User, connection_id: int) -> tuple[MediaServerConnection, User]:
+    """A connection of the owner or of one of their profiles, with the user it belongs to."""
+    conn = (await db.execute(
+        select(MediaServerConnection).where(MediaServerConnection.id == connection_id)
+    )).scalar_one_or_none()
+    if conn is not None and conn.user_id == owner.id:
+        return conn, owner
+    if conn is not None:
+        target = (await db.execute(
+            select(User).where(User.id == conn.user_id, User.managed_by_user_id == owner.id)
+        )).scalar_one_or_none()
+        if target is not None:
+            return conn, target
+    # Same answer for "doesn't exist" and "someone else's", so ids can't be probed.
+    raise HTTPException(status.HTTP_404_NOT_FOUND, "Connection not found")
+
+
+async def _has_active_job(db: AsyncSession, connection_id: int, job_type: str) -> bool:
+    job = (await db.execute(
+        select(SyncJob)
+        .where(
+            SyncJob.connection_id == connection_id,
+            SyncJob.job_type == job_type,
+            SyncJob.status.in_([SyncStatus.pending, SyncStatus.running]),
+        )
+        .order_by(SyncJob.created_at.desc(), SyncJob.id.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    return job is not None and is_active(job.status, job.updated_at, utcnow())
+
+
+async def _start_job(
+    db: AsyncSession, background_tasks: BackgroundTasks, kind: str, conn: MediaServerConnection, target: User
+) -> dict:
+    """Start a pull or push for one connection exactly as its own owner would from the Connections page.
+
+    Skips (rather than doubling up) when one is already queued or running. Jobs
+    started in one request run one after the other: they share the request's
+    background queue, and Scrob only ever runs one sync at a time anyway.
+    """
+    from routers import sync as sync_router  # imported here: sync.py is large and imports a lot
+
+    if await _has_active_job(db, conn.id, kind):
+        return {"connection_id": conn.id, "status": "already running"}
+    try:
+        if kind == "pull":
+            result = await sync_router.sync_connection(
+                conn.id, background_tasks, movie_limit=0, show_limit=0, full=False, db=db, current_user=target,
+            )
+        else:
+            result = await sync_router.push_upstream(conn.id, background_tasks, db=db, current_user=target)
+    except HTTPException as exc:
+        return {"connection_id": conn.id, "status": "error", "detail": str(exc.detail)}
+    return {"connection_id": conn.id, "status": "started", "job_id": result.get("job_id")}
+
+
+async def _start_one(
+    kind: str, connection_id: int, background_tasks: BackgroundTasks, db: AsyncSession, owner: User
+) -> dict:
+    _require_owner(owner)
+    conn, target = await _household_connection(db, owner, connection_id)
+    result = await _start_job(db, background_tasks, kind, conn, target)
+    if result["status"] == "error":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, result.get("detail") or "Couldn't start")
+    return result
+
+
+@router.post("/connections/{connection_id}/pull")
+async def pull_connection(
+    connection_id: int,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Pull one of the household's connections (the owner's or a profile's)."""
+    return await _start_one("pull", connection_id, background_tasks, db, current_user)
+
+
+@router.post("/connections/{connection_id}/push")
+async def push_connection(
+    connection_id: int,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Push to one of the household's connections (the owner's or a profile's)."""
+    return await _start_one("push", connection_id, background_tasks, db, current_user)
+
+
+async def _start_all(kind: str, background_tasks: BackgroundTasks, db: AsyncSession, owner: User) -> dict:
+    _require_owner(owner)
+    people = await _household_people(db, owner)
+    conns = (await db.execute(
+        select(MediaServerConnection)
+        .where(MediaServerConnection.user_id.in_([p.id for p in people]))
+        .order_by(MediaServerConnection.id)
+    )).scalars().all()
+    people_by_id = {p.id: p for p in people}
+    order = {p.id: i for i, p in enumerate(people)}
+    results = []
+    for conn in sorted(conns, key=lambda c: (order[c.user_id], c.id)):
+        if kind == "push" and not conn.push_enabled:
+            continue
+        results.append(await _start_job(db, background_tasks, kind, conn, people_by_id[conn.user_id]))
+    return {"results": results, "started": sum(1 for r in results if r["status"] == "started")}
+
+
+@router.post("/pull-all")
+async def pull_all(
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Queue a pull for every connection in the household, one after another (you first)."""
+    return await _start_all("pull", background_tasks, db, current_user)
+
+
+@router.post("/push-all")
+async def push_all(
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Queue a push for every connection that has pushing switched on, one after another."""
+    return await _start_all("push", background_tasks, db, current_user)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
