@@ -6796,7 +6796,7 @@ async def _push_emby_playback_progress(db: AsyncSession, conn: MediaServerConnec
     """
     stats = {"pushed": 0, "skipped": 0, "failed": 0, "in_progress_items": 0, "matched_to_emby": 0}
     rows = (await db.execute(
-        select(PlaybackProgress.media_id, PlaybackProgress.progress_seconds)
+        select(PlaybackProgress.media_id, PlaybackProgress.progress_seconds, PlaybackProgress.updated_at)
         .where(
             PlaybackProgress.user_id == user_id,
             PlaybackProgress.progress_seconds > 0,
@@ -6804,7 +6804,8 @@ async def _push_emby_playback_progress(db: AsyncSession, conn: MediaServerConnec
             PlaybackProgress.progress_percent < 0.9,
         )
     )).all()
-    seconds_by_media = {media_id: seconds for media_id, seconds in rows}
+    seconds_by_media = {media_id: seconds for media_id, seconds, _ in rows}
+    updated_by_media = {media_id: updated for media_id, _, updated in rows}
     stats["in_progress_items"] = len(seconds_by_media)
     if not seconds_by_media:
         return stats
@@ -6844,7 +6845,7 @@ async def _push_emby_playback_progress(db: AsyncSession, conn: MediaServerConnec
 
     stats["matched_to_emby"] = len(media_by_sid)
     targets = [
-        (sid, seconds_by_media[next(iter(mids))])
+        (sid, seconds_by_media[next(iter(mids))], updated_by_media[next(iter(mids))])
         for sid, mids in media_by_sid.items()
         if len(mids) == 1
     ]
@@ -6852,14 +6853,16 @@ async def _push_emby_playback_progress(db: AsyncSession, conn: MediaServerConnec
 
     sem = asyncio.Semaphore(5)
 
-    async def _push_one(sid: str, seconds: int) -> tuple[str, int, str, dict]:
+    async def _push_one(sid: str, seconds: int, updated) -> tuple[str, int, str, dict]:
         info: dict = {}
         async with sem:
-            outcome = await emby.set_playback_position(conn.url, conn.token, conn.server_user_id, sid, seconds, info=info)
+            outcome = await emby.set_playback_position(
+                conn.url, conn.token, conn.server_user_id, sid, seconds, info=info, played_at=updated,
+            )
         return sid, seconds, outcome, info
 
     shown = 0
-    for sid, seconds, outcome, info in await asyncio.gather(*(_push_one(sid, seconds) for sid, seconds in targets)):
+    for sid, seconds, outcome, info in await asyncio.gather(*(_push_one(sid, seconds, updated) for sid, seconds, updated in targets)):
         key = "skipped" if outcome.startswith("skipped") else outcome
         stats[key] = stats.get(key, 0) + 1
         if outcome != "pushed" and shown < 20:

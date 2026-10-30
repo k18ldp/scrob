@@ -1,7 +1,7 @@
 # Emby and Jellyfin share the same REST API — functions are re-exported, except
 # mark_watched, which differs: Emby's PlayedItems endpoint rejects the ISO 8601
 # DatePlayed Jellyfin accepts (HTTP 500, FormatException) and needs yyyyMMddHHmmss.
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 
@@ -44,7 +44,7 @@ TICKS_PER_SECOND = 10_000_000
 POSITION_TOLERANCE_SECONDS = 5
 
 
-async def set_playback_position(url: str, token: str, user_id: str, item_id: str, position_seconds: int, client: httpx.AsyncClient | None = None, info: dict | None = None) -> str:
+async def set_playback_position(url: str, token: str, user_id: str, item_id: str, position_seconds: int, client: httpx.AsyncClient | None = None, info: dict | None = None, played_at: datetime | None = None) -> str:
     """Write a resume position onto an Emby item so it shows in Continue Watching.
 
     Returns "pushed", "failed" or a "skipped..." reason ("skipped_played",
@@ -54,6 +54,10 @@ async def set_playback_position(url: str, token: str, user_id: str, item_id: str
     already played, when Emby's own position is already at (or beyond) ours, or
     when the position would be at/after the end of the item (that would be a
     finished play, which is mark_watched's job, not a resume point).
+
+    Emby lists an item under Continue Watching by its last-played date, so an item
+    without one is stamped with ``played_at`` (naive = UTC; default now). If Emby
+    already has our position but no date, only the date is added.
 
     POST .../UserData replaces the *entire* UserData object rather than patching
     it, so the current UserData is fetched first and merged - same approach as
@@ -82,11 +86,24 @@ async def set_playback_position(url: str, token: str, user_id: str, item_id: str
             info.update(played=bool(user_data.get("Played")), emby_seconds=current // TICKS_PER_SECOND, runtime_seconds=runtime // TICKS_PER_SECOND)
         if user_data.get("Played"):
             return "skipped_played"
-        if current >= ticks - POSITION_TOLERANCE_SECONDS * TICKS_PER_SECOND:
+        last_played = user_data.get("LastPlayedDate")
+        position_ok = current >= ticks - POSITION_TOLERANCE_SECONDS * TICKS_PER_SECOND
+        if position_ok and (last_played or current <= 0):
             return "skipped_emby_ahead"
-        if runtime and ticks >= runtime:
+        if not position_ok and runtime and ticks >= runtime:
             return "skipped_at_end"
-        r = await c.post(f"{item_url}/UserData", headers=post_headers, json={**user_data, "PlaybackPositionTicks": ticks})
+        body = {**user_data, "PlaybackPositionTicks": current if position_ok else ticks}
+        stamped = not last_played
+        if stamped:
+            when = played_at or datetime.now(timezone.utc)
+            if when.tzinfo is not None:
+                when = when.astimezone(timezone.utc).replace(tzinfo=None)
+            body["LastPlayedDate"] = when.strftime("%Y-%m-%dT%H:%M:%SZ")
+        r = await c.post(f"{item_url}/UserData", headers=post_headers, json=body)
+        if r.status_code >= 400 and stamped:
+            # Emby didn't like the date: still write the position without it.
+            body.pop("LastPlayedDate", None)
+            r = await c.post(f"{item_url}/UserData", headers=post_headers, json=body)
         return "pushed" if r.status_code < 400 else "failed"
 
     try:
