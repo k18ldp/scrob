@@ -6738,11 +6738,57 @@ async def _save_push_state(db: AsyncSession, push_state: PushState, connection_i
         await db.rollback()
 
 
+async def _lookup_emby_item_ids(db: AsyncSession, conn: MediaServerConnection, media_ids: list[int]) -> dict[int, str]:
+    """Find Emby item ids by TMDB id for media Scrob hasn't linked to this Emby yet.
+
+    Same approach the watched push uses (one paged TMDB index per library type,
+    then a series-scoped episode lookup) so it never relies on AnyProviderIdEquals.
+    Items that can't be found are simply left out.
+    """
+    media_rows = (await db.execute(select(Media).where(Media.id.in_(media_ids)))).scalars().all()
+    show_ids = {m.show_id for m in media_rows if m.show_id}
+    show_tmdb: dict[int, int] = {}
+    if show_ids:
+        shows = await db.execute(select(Show.id, Show.tmdb_id).where(Show.id.in_(show_ids)))
+        show_tmdb = {show_id: tmdb_id for show_id, tmdb_id in shows.all() if tmdb_id}
+
+    movie_index: dict[int, str] | None = None
+    series_index: dict[int, str] | None = None
+    found: dict[int, str] = {}
+    for m in media_rows:
+        try:
+            sid = None
+            if m.media_type == MediaType.movie and m.tmdb_id:
+                if movie_index is None:
+                    movie_index = await emby.build_tmdb_index(conn.url, conn.token, "Movie")
+                sid = movie_index.get(m.tmdb_id)
+            elif (
+                m.media_type == MediaType.episode
+                and m.show_id in show_tmdb
+                and m.season_number is not None
+                and m.episode_number is not None
+            ):
+                if series_index is None:
+                    series_index = await emby.build_tmdb_index(conn.url, conn.token, "Series")
+                series_id = series_index.get(show_tmdb[m.show_id])
+                if series_id:
+                    item = await emby.find_episode_in_series(
+                        conn.url, conn.token, series_id, m.season_number, m.episode_number, user_id=conn.server_user_id
+                    )
+                    sid = item.get("Id") if item else None
+            if sid:
+                found[m.id] = str(sid)
+        except Exception:
+            logger.exception("Emby lookup failed for media %s", m.id)
+    return found
+
+
 async def _push_emby_playback_progress(db: AsyncSession, conn: MediaServerConnection, user_id: int) -> dict[str, int]:
     """Push Scrob's in-progress (part-watched) positions to an Emby connection.
 
-    Only Emby, only items Scrob already knows the server item id for, and only
-    unfinished plays (>0s and under the 90% mark the webhooks treat as watched).
+    Only Emby, and only unfinished plays (>0s and under the 90% mark the webhooks
+    treat as watched). The Emby item id comes from Scrob's collection links, or a
+    TMDB lookup in Emby for items not linked yet.
     Server items shared by several local media rows (combined multi-episode
     files) are skipped: one position can't be attributed to a single row.
     emby.set_playback_position never touches played items and never moves an
@@ -6780,6 +6826,16 @@ async def _push_emby_playback_progress(db: AsyncSession, conn: MediaServerConnec
         )
         for source_id, media_id in files.all():
             sids_by_media.setdefault(media_id, set()).add(source_id)
+
+    # Part-watched items Scrob hasn't linked to this Emby yet (e.g. just watched
+    # elsewhere, before the next Pull): look them up by TMDB id instead.
+    unlinked = [mid for mid in seconds_by_media if mid not in sids_by_media]
+    stats["unlinked"] = len(unlinked)
+    if unlinked:
+        looked_up = await _lookup_emby_item_ids(db, conn, unlinked)
+        stats["found_by_lookup"] = len(looked_up)
+        for mid, sid in looked_up.items():
+            sids_by_media.setdefault(mid, set()).add(sid)
 
     media_by_sid: dict[str, set[int]] = {}
     for media_id, sids in sids_by_media.items():
