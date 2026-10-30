@@ -1,7 +1,7 @@
 import asyncio
 import re
 import httpx
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict
 
 TIMEOUT = httpx.Timeout(120.0)  # 120 second timeout
@@ -488,10 +488,34 @@ async def scan_libraries(url: str, token: str) -> bool:
 
 PUSH_TIMEOUT = httpx.Timeout(15.0)  # shorter timeout for bulk push operations
 
-async def mark_watched(url: str, token: str, user_id: str, item_id: str, client: httpx.AsyncClient | None = None, played_at: datetime | None = None) -> bool:
-    """Mark a Jellyfin/Emby item as played, optionally stamped with the original watch date (naive UTC)."""
+JELLYFIN_DATE_PLAYED_FORMAT = "%Y-%m-%dT%H:%M:%SZ"  # ISO 8601 UTC
+EMBY_DATE_PLAYED_FORMAT = "%Y%m%d%H%M%S"            # Emby only parses yyyyMMddHHmmss (UTC)
+_ALLOWED_DATE_PLAYED_FORMATS = frozenset({JELLYFIN_DATE_PLAYED_FORMAT, EMBY_DATE_PLAYED_FORMAT})
+
+
+def format_date_played(played_at: datetime, fmt: str = JELLYFIN_DATE_PLAYED_FORMAT) -> str:
+    """Format a watch date for the DatePlayed query param, always in UTC.
+
+    Naive datetimes are treated as UTC (that's how Scrob stores them); aware
+    ones are converted to UTC so a non-UTC offset can never shift the date.
+    Only the two known formats are accepted, so the output is always purely
+    numeric strftime fields and can't carry anything else into the request URL.
+    """
+    if fmt not in _ALLOWED_DATE_PLAYED_FORMATS:
+        raise ValueError("unsupported DatePlayed format")
+    if played_at.tzinfo is not None:
+        played_at = played_at.astimezone(timezone.utc).replace(tzinfo=None)
+    return played_at.strftime(fmt)
+
+
+async def mark_watched(url: str, token: str, user_id: str, item_id: str, client: httpx.AsyncClient | None = None, played_at: datetime | None = None, date_format: str = JELLYFIN_DATE_PLAYED_FORMAT) -> bool:
+    """Mark a Jellyfin/Emby item as played, optionally stamped with the original watch date (UTC).
+
+    ``date_format`` selects how DatePlayed is serialised: Jellyfin accepts ISO 8601,
+    Emby requires yyyyMMddHHmmss (see core.emby.mark_watched).
+    """
     headers = _auth_headers(token)
-    params = {"DatePlayed": played_at.strftime("%Y-%m-%dT%H:%M:%SZ")} if played_at else None
+    params = {"DatePlayed": format_date_played(played_at, date_format)} if played_at else None
     try:
         if client:
             r = await client.post(f"{url.rstrip('/')}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, params=params)
