@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Household profiles - Scrob</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #09090b; color: #e4e4e7; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  p.sub, .muted { color: #a1a1aa; margin: 0 0 20px; font-size: 14px; }
+  a { color: #93c5fd; }
+  section { background: #18181b; border: 1px solid #27272a; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row.between { justify-content: space-between; }
+  .profile { border-top: 1px solid #27272a; padding: 12px 0; }
+  .profile:first-of-type { border-top: 0; padding-top: 0; }
+  .name { font-weight: 600; }
+  .key { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: #d4d4d8; word-break: break-all; }
+  button, select, input { font: inherit; color: inherit; background: #27272a; border: 1px solid #3f3f46; border-radius: 8px; padding: 6px 10px; }
+  button { cursor: pointer; }
+  button:hover { background: #3f3f46; }
+  button.primary { background: #2563eb; border-color: #2563eb; }
+  button.danger { color: #fca5a5; }
+  input[type=text] { min-width: 180px; }
+  #status { min-height: 22px; margin-bottom: 12px; font-size: 14px; }
+  #status.err { color: #fca5a5; }
+  #status.ok { color: #86efac; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+  td { padding: 6px 4px; border-top: 1px solid #27272a; vertical-align: middle; }
+  small { color: #a1a1aa; }
+</style>
+</head>
+<body>
+<main>
+  <p class="muted"><a href="/">&larr; Back to Scrob</a></p>
+  <h1>Household profiles</h1>
+  <p class="sub">One login, a separate watch history for each person. Profiles have no password; you switch into them from here.</p>
+  <div id="status"></div>
+  <div id="app">Loading...</div>
+</main>
+<script>
+(function () {
+  "use strict";
+  var app = document.getElementById("app");
+  var statusEl = document.getElementById("status");
+
+  function el(tag, props) {
+    var e = document.createElement(tag);
+    props = props || {};
+    Object.keys(props).forEach(function (k) {
+      var v = props[k];
+      if (k === "class") e.className = v;
+      else if (k.indexOf("on") === 0) e.addEventListener(k.slice(2), v);
+      else e.setAttribute(k, v);
+    });
+    for (var i = 2; i < arguments.length; i++) {
+      var kid = arguments[i];
+      if (kid !== null && kid !== undefined) e.append(kid);
+    }
+    return e;
+  }
+  function say(msg, kind) { statusEl.textContent = msg || ""; statusEl.className = kind || ""; }
+
+  function api(path, opts) {
+    opts = opts || {};
+    var init = { method: opts.method || "GET", credentials: "same-origin", headers: {} };
+    if (opts.body !== undefined) { init.body = JSON.stringify(opts.body); init.headers["Content-Type"] = "application/json"; }
+    return fetch("/api/proxy" + path, init).then(function (r) {
+      if (r.status === 401) { window.location.href = "/login"; throw new Error("Please sign in"); }
+      if (!r.ok) {
+        return r.json().catch(function () { return {}; }).then(function (d) {
+          throw new Error(typeof d.detail === "string" ? d.detail : (r.statusText || ("HTTP " + r.status)));
+        });
+      }
+      return r.json();
+    });
+  }
+
+  function postForm(action, fields) {
+    var f = el("form", { method: "POST", action: action });
+    Object.keys(fields).forEach(function (k) { f.append(el("input", { type: "hidden", name: k, value: String(fields[k]) })); });
+    document.body.append(f);
+    f.submit();
+  }
+
+  function render() {
+    return api("/profiles").then(function (data) {
+      app.textContent = "";
+      if (data.managed) return renderManaged(data);
+      renderOwner(data);
+    }).catch(function (e) { app.textContent = ""; say(e.message, "err"); });
+  }
+
+  function renderManaged(data) {
+    app.append(el("section", {},
+      el("h2", {}, "You are viewing as " + data.username),
+      el("p", { class: "muted" }, "This is a managed profile. Switch back to your own account to manage profiles."),
+      el("button", { class: "primary", onclick: function () { postForm("/profile-switch", { back: 1 }); } }, "Back to my account")
+    ));
+  }
+
+  function renderOwner(data) {
+    var profiles = data.profiles;
+
+    var list = el("section", {}, el("h2", {}, "Profiles"));
+    if (!profiles.length) list.append(el("p", { class: "muted" }, "No profiles yet. Add one below, or import them from an Emby server."));
+    profiles.forEach(function (p) {
+      var keyText = el("span", { class: "key" }, "••••••••••");
+      var shown = false;
+      var showBtn = el("button", { onclick: function () {
+        shown = !shown;
+        keyText.textContent = shown ? p.api_key : "••••••••••";
+        showBtn.textContent = shown ? "Hide key" : "Show API key";
+      } }, "Show API key");
+      var conns = el("div", { class: "muted" }, p.connections.length
+        ? "Connections: " + p.connections.map(function (c) { return c.name + (c.server_username ? " (" + c.server_username + ")" : ""); }).join(", ")
+        : "No server connections yet");
+      list.append(el("div", { class: "profile" },
+        el("div", { class: "row between" },
+          el("span", { class: "name" }, p.username),
+          el("span", { class: "row" },
+            el("button", { class: "primary", onclick: function () { postForm("/profile-switch", { profile_id: p.id }); } }, "Switch to"),
+            el("button", { class: "danger", onclick: function () {
+              if (!window.confirm("Delete " + p.username + " and ALL of their watch history, ratings and connections? This cannot be undone.")) return;
+              api("/profiles/" + p.id, { method: "DELETE" }).then(function () { say("Deleted " + p.username, "ok"); render(); })
+                .catch(function (e) { say(e.message, "err"); });
+            } }, "Delete"))),
+        conns,
+        el("div", { class: "row" }, showBtn, keyText),
+        el("small", {}, "Use this key in the Silo plugin for this person, and in their Emby webhook URL.")
+      ));
+    });
+    app.append(list);
+
+    var nameInput = el("input", { type: "text", placeholder: "Name, e.g. Sam", maxlength: "60" });
+    app.append(el("section", {},
+      el("h2", {}, "Add a profile"),
+      el("div", { class: "row" }, nameInput, el("button", { class: "primary", onclick: function () {
+        var name = nameInput.value.trim();
+        if (!name) return;
+        api("/profiles", { method: "POST", body: { name: name } })
+          .then(function () { say("Added " + name, "ok"); render(); })
+          .catch(function (e) { say(e.message, "err"); });
+      } }, "Add"))));
+
+    app.append(importSection(data));
+  }
+
+  function importSection(data) {
+    var box = el("section", {}, el("h2", {}, "Import people from an Emby / Jellyfin server"),
+      el("p", { class: "muted" }, "Lists the users on one of your server connections so you can link each to a profile. Needs an administrator API key on that connection."));
+    var select = el("select", {});
+    var results = el("div", {});
+    var loadBtn = el("button", { disabled: "disabled" }, "Load users");
+    box.append(el("div", { class: "row" }, select, loadBtn), results);
+
+    api("/auth/connections").then(function (conns) {
+      var servers = conns.filter(function (c) { return c.type === "emby" || c.type === "jellyfin"; });
+      if (!servers.length) { select.append(el("option", { value: "" }, "No Emby/Jellyfin connections")); return; }
+      servers.forEach(function (c) { select.append(el("option", { value: String(c.id) }, c.name + " - " + c.url)); });
+      loadBtn.removeAttribute("disabled");
+    }).catch(function (e) { say(e.message, "err"); });
+
+    loadBtn.addEventListener("click", function () {
+      var connectionId = Number(select.value);
+      if (!connectionId) return;
+      results.textContent = "Loading...";
+      api("/profiles/server-users?connection_id=" + connectionId).then(function (users) {
+        results.textContent = "";
+        var table = el("table", {});
+        var rows = [];
+        users.forEach(function (u) {
+          var choice = el("select", {},
+            el("option", { value: "" }, "Skip"),
+            el("option", { value: "me" }, "Me (" + data.username + ")"),
+            el("option", { value: "new" }, "New profile..."));
+          data.profiles.forEach(function (p) { choice.append(el("option", { value: String(p.id) }, p.username)); });
+          var newName = el("input", { type: "text", value: u.name, maxlength: "60", style: "display:none" });
+          choice.addEventListener("change", function () { newName.style.display = choice.value === "new" ? "" : "none"; });
+          var linked = u.linked_profile_id;
+          if (linked) { choice.setAttribute("disabled", "disabled"); }
+          table.append(el("tr", {},
+            el("td", {}, el("span", { class: "name" }, u.name || u.id)),
+            el("td", {}, linked ? el("small", {}, "Already linked") : el("span", { class: "row" }, choice, newName))));
+          if (!linked) rows.push({ user: u, choice: choice, newName: newName });
+        });
+        results.append(table);
+        results.append(el("button", { class: "primary", onclick: function () {
+          var people = [];
+          rows.forEach(function (r) {
+            var v = r.choice.value;
+            if (!v) return;
+            var person = { emby_user_id: r.user.id, emby_username: r.user.name };
+            if (v === "me") person.profile_id = data.owner_id;
+            else if (v === "new") person.new_profile_name = r.newName.value.trim();
+            else person.profile_id = Number(v);
+            people.push(person);
+          });
+          if (!people.length) { say("Pick a profile for at least one person.", "err"); return; }
+          api("/profiles/import-server-users", { method: "POST", body: { connection_id: connectionId, people: people } })
+            .then(function (res) {
+              var linkedCount = res.results.filter(function (x) { return x.status === "linked"; }).length;
+              say("Linked " + linkedCount + " of " + people.length + ". Switch into each profile and run a Pull to bring in their history.", "ok");
+              render();
+            }).catch(function (e) { say(e.message, "err"); });
+        } }, "Link selected"));
+      }).catch(function (e) { results.textContent = ""; say(e.message, "err"); });
+    });
+    return box;
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

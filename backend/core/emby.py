@@ -113,3 +113,28 @@ async def set_playback_position(url: str, token: str, user_id: str, item_id: str
             return await _do(c)
     except Exception:
         return "failed"
+
+
+async def list_users(url: str, token: str, client: httpx.AsyncClient | None = None) -> list[dict] | None:
+    """The users on an Emby (or Jellyfin) server as [{"id", "name"}], or None if it can't be read.
+
+    GET /Users needs an administrator API key.
+    """
+    headers = _auth_headers(token)
+
+    async def _do(c: httpx.AsyncClient) -> list[dict]:
+        r = await c.get(f"{url.rstrip('/')}/Users", headers=headers)
+        r.raise_for_status()
+        return [
+            {"id": str(u["Id"]), "name": str(u.get("Name") or "")}
+            for u in r.json()
+            if isinstance(u, dict) and u.get("Id")
+        ]
+
+    try:
+        if client:
+            return await _do(client)
+        async with httpx.AsyncClient(timeout=PUSH_TIMEOUT, follow_redirects=False) as c:
+            return await _do(c)
+    except Exception:
+        return None

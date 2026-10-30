@@ -21,6 +21,9 @@ class User(Base):
     email_confirmed : Mapped[bool]           = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     totp_enabled  : Mapped[bool]           = mapped_column(Boolean, nullable=False, default=False)
     totp_secret   : Mapped[Optional[str]]  = mapped_column(String(255))
+    # Set for a "managed profile": a password-less account owned by (and only reachable by
+    # switching from) another user, e.g. a household member the owner manages.
+    managed_by_user_id : Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     created_at    : Mapped[datetime]       = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at    : Mapped[datetime]       = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
