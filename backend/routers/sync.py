@@ -6748,7 +6748,7 @@ async def _push_emby_playback_progress(db: AsyncSession, conn: MediaServerConnec
     emby.set_playback_position never touches played items and never moves an
     Emby resume point backwards.
     """
-    stats = {"pushed": 0, "skipped": 0, "failed": 0}
+    stats = {"pushed": 0, "skipped": 0, "failed": 0, "in_progress_items": 0, "matched_to_emby": 0}
     rows = (await db.execute(
         select(PlaybackProgress.media_id, PlaybackProgress.progress_seconds)
         .where(
@@ -6759,6 +6759,7 @@ async def _push_emby_playback_progress(db: AsyncSession, conn: MediaServerConnec
         )
     )).all()
     seconds_by_media = {media_id: seconds for media_id, seconds in rows}
+    stats["in_progress_items"] = len(seconds_by_media)
     if not seconds_by_media:
         return stats
 
@@ -6785,6 +6786,7 @@ async def _push_emby_playback_progress(db: AsyncSession, conn: MediaServerConnec
         for sid in sids:
             media_by_sid.setdefault(sid, set()).add(media_id)
 
+    stats["matched_to_emby"] = len(media_by_sid)
     targets = [
         (sid, seconds_by_media[next(iter(mids))])
         for sid, mids in media_by_sid.items()
@@ -6870,15 +6872,18 @@ async def _run_full_push(user_id: int, connection_id: int, job_id: int, incremen
             push_mode = push_plan.mode
             push_state = await PushState.load(db, conn.id, push_plan)
 
-            if conn.type == "emby" and conn.push_playback:
-                await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(current_step="Pushing playback progress"))
-                await db.commit()
-                try:
-                    progress_stats = await _push_emby_playback_progress(db, conn, user_id)
-                    logger.info("Emby playback progress push for connection %s: %s", connection_id, progress_stats)
-                except Exception:
-                    # Best effort: a progress failure must not fail the watched/ratings push.
-                    logger.exception("Emby playback progress push failed for connection %s", connection_id)
+            if conn.type == "emby":
+                if not conn.push_playback:
+                    print(f"Emby playback progress push for connection {connection_id}: off (enable 'Playback progress' under Scrob -> Emby and click Save changes)")
+                else:
+                    await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(current_step="Pushing playback progress"))
+                    await db.commit()
+                    try:
+                        progress_stats = await _push_emby_playback_progress(db, conn, user_id)
+                        print(f"Emby playback progress push for connection {connection_id}: {progress_stats}")
+                    except Exception:
+                        # Best effort: a progress failure must not fail the watched/ratings push.
+                        logger.exception("Emby playback progress push failed for connection %s", connection_id)
 
             if conn.type == "nuvio":
                 settings_result = await db.execute(
