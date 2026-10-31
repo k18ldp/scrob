@@ -1,4 +1,5 @@
 import asyncio
+import time
 import logging
 import re
 from typing import Any
@@ -3075,6 +3076,11 @@ async def _run_emby_sync(user_id: int, job_id: int, movie_limit: int, show_limit
                 libraries = [lib for lib in libraries if lib.get("Id") in selected_ids]
 
             print(f"  Found {len(libraries)} libraries to sync")
+            # With the collection switched off the pull only needs what this user has played or
+            # started, so don't download and match every item in the library (hours on a big server).
+            watched_only = not conn.sync_collection
+            if watched_only:
+                print("  Collection sync is off for this connection: reading played / in-progress items only")
             stats = {"movies": 0, "episodes": 0, "skipped": 0, "errors": 0}
             all_warnings: list[dict] = []
             total_discovered = 0
@@ -3091,7 +3097,13 @@ async def _run_emby_sync(user_id: int, job_id: int, movie_limit: int, show_limit
                 print(f"  Processing library: {lib_name} ({lib_type})")
 
                 if lib_type == "movies":
-                    items = await emby.get_movies(lib_id, e_url, e_token, e_user)
+                    await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(current_step=f"Reading {lib_name} from Emby"))
+                    await db.commit()
+                    if watched_only:
+                        items = await emby.get_items_with_user_state(lib_id, e_url, e_token, e_user, "Movie")
+                        print(f"    Collection sync is off: {len(items)} played or in-progress movies in {lib_name}")
+                    else:
+                        items = await emby.get_movies(lib_id, e_url, e_token, e_user)
 
                     if movie_limit:
                         items = items[:movie_limit]
@@ -3144,7 +3156,18 @@ async def _run_emby_sync(user_id: int, job_id: int, movie_limit: int, show_limit
                     all_warnings.extend(w)
 
                 elif lib_type in ("tvshows", "tv"):
+                    await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(current_step=f"Reading {lib_name} from Emby"))
+                    await db.commit()
                     shows = await emby.get_shows(lib_id, e_url, e_token, e_user)
+                    prefetched_episodes: list | None = None
+                    if watched_only:
+                        # Read only the episodes this user has played or started, then keep just
+                        # their shows - so the TMDB show lookups below cover those, not the library.
+                        prefetched_episodes = await emby.get_items_with_user_state(lib_id, e_url, e_token, e_user, "Episode")
+                        wanted_series_ids = {str(e.get("SeriesId")) for e in prefetched_episodes}
+                        shows = [s for s in shows if str(s.get("Id")) in wanted_series_ids]
+                        print(f"    Collection sync is off: {len(prefetched_episodes)} played or in-progress episodes "
+                              f"across {len(shows)} shows in {lib_name}")
                     if show_limit:
                         shows = shows[:show_limit]
 
@@ -3170,7 +3193,12 @@ async def _run_emby_sync(user_id: int, job_id: int, movie_limit: int, show_limit
                             "reason": "Unmatched on source — no TMDB ID available for the series",
                         })
 
-                    items = await emby.get_episodes(lib_id, e_url, e_token, e_user)
+                    if prefetched_episodes is not None:
+                        items = prefetched_episodes
+                    else:
+                        await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(current_step=f"Reading episodes of {lib_name} from Emby"))
+                        await db.commit()
+                        items = await emby.get_episodes(lib_id, e_url, e_token, e_user)
                     filtered_episodes = [e for e in items if str(e.get("SeriesId")) in show_map]
                     unmatched_series_ids = {str(s.get("Id")) for s in shows if str(s.get("Id")) not in show_map}
                     unmatched_series_episodes = [e for e in items if str(e.get("SeriesId")) in unmatched_series_ids]
@@ -6752,6 +6780,24 @@ async def _save_push_state(db: AsyncSession, push_state: PushState, connection_i
         await db.rollback()
 
 
+# tmdb_id -> Emby item id, per (connection, item type). Reading a big library takes a while, and
+# several lookups can fire close together (a watch on another server, a resume-position push), so
+# an index is reused for a few minutes. Anything added to the server since is picked up next time.
+_EMBY_INDEX_TTL_SECONDS = 600
+_emby_index_cache: dict[tuple[int, str], tuple[float, dict[int, str]]] = {}
+
+
+async def _emby_tmdb_index(conn: MediaServerConnection, item_type: str) -> dict[int, str]:
+    key = (conn.id, item_type)
+    hit = _emby_index_cache.get(key)
+    now = time.monotonic()
+    if hit is not None and now - hit[0] < _EMBY_INDEX_TTL_SECONDS:
+        return hit[1]
+    index = await emby.build_tmdb_index(conn.url, conn.token, item_type)
+    _emby_index_cache[key] = (now, index)
+    return index
+
+
 async def _lookup_emby_item_ids(db: AsyncSession, conn: MediaServerConnection, media_ids: list[int]) -> dict[int, str]:
     """Find Emby item ids by TMDB id for media Scrob hasn't linked to this Emby yet.
 
@@ -6774,7 +6820,7 @@ async def _lookup_emby_item_ids(db: AsyncSession, conn: MediaServerConnection, m
             sid = None
             if m.media_type == MediaType.movie and m.tmdb_id:
                 if movie_index is None:
-                    movie_index = await emby.build_tmdb_index(conn.url, conn.token, "Movie")
+                    movie_index = await _emby_tmdb_index(conn, "Movie")
                 sid = movie_index.get(m.tmdb_id)
             elif (
                 m.media_type == MediaType.episode
@@ -6783,7 +6829,7 @@ async def _lookup_emby_item_ids(db: AsyncSession, conn: MediaServerConnection, m
                 and m.episode_number is not None
             ):
                 if series_index is None:
-                    series_index = await emby.build_tmdb_index(conn.url, conn.token, "Series")
+                    series_index = await _emby_tmdb_index(conn, "Series")
                 series_id = series_index.get(show_tmdb[m.show_id])
                 if series_id:
                     item = await emby.find_episode_in_series(

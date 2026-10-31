@@ -27,6 +27,7 @@ from core.translations import get_user_metadata_language, get_media_translations
 from core.rewatch import get_active_rewatch, record_rewatch_progress, get_already_watched_for_bulk_mark, capped_season_episode_counts
 from core.watch_dedup import get_dedup_window_minutes, find_duplicate_watch_event
 from core.enrichment import create_media_safely
+from core.push_targets import file_belongs_to_connection, media_needing_lookup
 from core.episode_order import get_episode_orders_for_series, get_tmdb_to_tvdb_positions
 
 from dependencies import get_current_user, get_current_user_or_api_key
@@ -124,6 +125,11 @@ async def _push_watch_state(
                 continue
             source_type = coll_file.source.value if hasattr(coll_file.source, "value") else str(coll_file.source)
             for conn in conn_by_type.get(source_type, []):
+                # An item id read from one server (say Emby A) means nothing - or worse, a
+                # different item - on another server of the same type, so only push it to
+                # the connection it came from.
+                if not file_belongs_to_connection(coll_file.connection_id, conn.id):
+                    continue
                 if coll_file.source == CollectionSource.plex:
                     label = f"plex connection {conn.id}"
                     if watched:
@@ -144,6 +150,31 @@ async def _push_watch_state(
                         tasks.append((label, emby_client.mark_watched(conn.url, conn.token, conn.server_user_id, coll_file.source_id, played_at=resolved_watched_at.get(coll_media_id))))
                     else:
                         tasks.append((label, emby_client.mark_unwatched(conn.url, conn.token, conn.server_user_id, coll_file.source_id)))
+
+        # An Emby connection that doesn't track a library (collection sync off) has no library
+        # files, and a second server may simply not have been pulled yet: find those items on
+        # the server by TMDB id instead, so watched state still reaches it straight away.
+        emby_conns = conn_by_type.get("emby", [])
+        if emby_conns:
+            mapped = {
+                (cf.connection_id, mid) for cf, mid in coll_files
+                if cf.source == CollectionSource.emby and cf.source_id
+            }
+            from routers.sync import _lookup_emby_item_ids
+            for conn_id, missing in media_needing_lookup([c.id for c in emby_conns], list(media_ids), mapped).items():
+                conn = next(c for c in emby_conns if c.id == conn_id)
+                try:
+                    found = await _lookup_emby_item_ids(db, conn, missing)
+                except Exception:
+                    logger.exception("Emby item lookup failed for connection %s", conn.id)
+                    continue
+                for mid, sid in found.items():
+                    label = f"emby connection {conn.id}"
+                    if watched:
+                        mark_pushed_watched(user_id, mid)
+                        tasks.append((label, emby_client.mark_watched(conn.url, conn.token, conn.server_user_id, sid, played_at=resolved_watched_at.get(mid))))
+                    else:
+                        tasks.append((label, emby_client.mark_unwatched(conn.url, conn.token, conn.server_user_id, sid)))
 
     push_simkl = settings and settings.simkl_push_watched and settings.simkl_access_token
     if push_simkl and settings.simkl_client_id:

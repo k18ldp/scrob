@@ -622,7 +622,7 @@ class PushWatchStateEchoSuppressionTests(unittest.IsolatedAsyncioTestCase):
     def _fixture(self, conn_type):
         conn = SimpleNamespace(id=1, type=conn_type, url="http://srv.local",
                                token="t", server_user_id="u1")
-        cf = SimpleNamespace(source=CollectionSource[conn_type], source_id="item-1")
+        cf = SimpleNamespace(source=CollectionSource[conn_type], source_id="item-1", connection_id=1)
         # query order: 1. connections, 2. settings, 3. collection files
         return _FakeSession([[conn], None, [(cf, 42)]])
 

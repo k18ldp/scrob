@@ -13,6 +13,7 @@ from core.jellyfin import (
     get_movies,
     get_shows,
     get_episodes,
+    get_items_with_user_state,
     get_item,
     get_items_batch,
     get_items_watched_state,

@@ -194,6 +194,10 @@
       el("div", { class: "row between" },
         el("span", { class: "cname" }, c.name + (c.server_username ? " (" + c.server_username + ")" : "")),
         el("span", { class: "chip " + pull.cls }, pull.chip)));
+    if (c.type === "emby") {
+      row.append(el("div", { class: "muted", style: "margin-top:2px" },
+        c.sync_collection === false ? "Pulls watched and in-progress items only (fast)" : "Pulls the whole library (slow on big servers)"));
+    }
     if (push) row.append(el("div", { class: "row between", style: "margin-top:4px" },
       el("span", { class: "muted" }, "Scrob → server"), el("span", { class: "chip " + push.cls }, push.chip)));
     [pull, push].forEach(function (s) {

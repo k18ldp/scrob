@@ -174,6 +174,7 @@ async def household_overview(db: AsyncSession = Depends(get_db), current_user: U
             "url": c.url,
             "server_username": c.server_username,
             "push_enabled": c.push_enabled,
+            "sync_collection": c.sync_collection,
             "pull": job_info.get("pull"),
             "push": job_info.get("push"),
         })

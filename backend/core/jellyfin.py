@@ -176,6 +176,7 @@ async def get_movies(library_id: str, url: str, token: str, user_id: str) -> lis
 
         total = data.get("TotalRecordCount", 0)
         start += page_size
+        _log_paging("movies", len(all_items), total, start // page_size)
         if start >= total:
             break
 
@@ -229,10 +230,65 @@ async def get_episodes(library_id: str, url: str, token: str, user_id: str) -> l
 
         total = data.get("TotalRecordCount", 0)
         start += page_size
+        _log_paging("episodes", len(all_items), total, start // page_size)
         if start >= total:
             break
 
     return all_items
+
+
+def _log_paging(kind: str, fetched: int, total: int, page_number: int, every: int = 10) -> None:
+    """Large libraries are read in many sequential pages; say how far along we are."""
+    if page_number % every == 0:
+        print(f"    Read {fetched}/{total} {kind} from the server...")
+
+
+# Fields wanted for items that go through the normal sync (same as get_movies / get_episodes).
+_MOVIE_SYNC_FIELDS = "ProviderIds,MediaStreams,Overview,Genres,CommunityRating,OfficialRating,RunTimeTicks,PremiereDate,UserData,DateCreated"
+_EPISODE_SYNC_FIELDS = "ProviderIds,MediaStreams,Overview,Genres,CommunityRating,RunTimeTicks,PremiereDate,UserData,DateCreated"
+# Emby/Jellyfin "Filters" values: finished items, and items stopped part way through.
+_USER_STATE_FILTERS = ("IsPlayed", "IsResumable")
+
+
+async def get_items_with_user_state(
+    library_id: str, url: str, token: str, user_id: str, item_type: str, page_size: int = 200,
+) -> list:
+    """Only the items of one type (``Movie`` or ``Episode``) in a library that this user has
+    finished or is part way through - instead of the whole library.
+
+    Lets a pull of a huge server read a few hundred items rather than tens of thousands.
+    Items that are merely rated are not included (the server can't filter on that).
+    """
+    if item_type not in ("Movie", "Episode"):
+        raise ValueError(f"unsupported item type: {item_type}")
+    fields = _MOVIE_SYNC_FIELDS if item_type == "Movie" else _EPISODE_SYNC_FIELDS
+    found: dict[str, dict] = {}
+    for state_filter in _USER_STATE_FILTERS:
+        start = 0
+        while True:
+            params = {
+                "ParentId": library_id,
+                "IncludeItemTypes": item_type,
+                "Recursive": True,
+                "Filters": state_filter,
+                "Fields": fields,
+                "Limit": page_size,
+                "StartIndex": start,
+            }
+            if item_type == "Episode":
+                params["ExcludeLocationTypes"] = "Virtual"
+                params["IsMissing"] = False
+            data = await _get(url, token, f"Users/{user_id}/Items", params=params)
+            items = data.get("Items", [])
+            for item in items:
+                found.setdefault(str(item.get("Id")), item)
+            total = data.get("TotalRecordCount", 0)
+            start += page_size
+            _log_paging(f"{state_filter} {item_type.lower()}s", len(found), total, start // page_size)
+            if not items or start >= total:
+                break
+    return list(found.values())
+
 
 def extract_quality(media_streams: list) -> dict:
     quality = {
