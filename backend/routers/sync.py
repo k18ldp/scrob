@@ -7384,10 +7384,20 @@ async def _run_full_push(user_id: int, connection_id: int, job_id: int, incremen
             jellyfin_series_tvdb_index: dict[int, str] = {}
             if conn.type in ("jellyfin", "emby") and media_info:
                 client_mod = jellyfin if conn.type == "jellyfin" else emby
+                await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(current_step="Reading the server's library to match items", updated_at=func.now()))
+                await db.commit()
+                print(f"  Push: matching {len(media_info)} items to {conn.type} connection {conn.id} (reading its library index)...")
+
+                async def _index(item_type: str) -> dict[int, str]:
+                    # Emby indexes are cached for a few minutes (shared with the live/progress pushes).
+                    if conn.type == "emby":
+                        return await _emby_tmdb_index(conn, item_type)
+                    return await client_mod.build_tmdb_index(conn.url, conn.token, item_type)
+
                 if any(m.media_type == MediaType.movie for m in media_info.values()):
-                    jellyfin_movie_index = await client_mod.build_tmdb_index(conn.url, conn.token, "Movie")
+                    jellyfin_movie_index = await _index("Movie")
                 if any(m.media_type == MediaType.episode for m in media_info.values()):
-                    jellyfin_series_index = await client_mod.build_tmdb_index(conn.url, conn.token, "Series")
+                    jellyfin_series_index = await _index("Series")
                     # Shows Scrob only ever matched via TVDB (e.g. a legacy-agent
                     # Plex library) have no Show.tmdb_id at all, so the index
                     # above can never resolve them - only build this second,

@@ -491,6 +491,7 @@ async def build_tmdb_index(url: str, token: str, item_type: str) -> Dict[int, st
                 index[tid] = item["Id"]
         total = data.get("TotalRecordCount", 0)
         start += page_size
+        _log_paging(f"{item_type.lower()} index entries", len(index), total, start // page_size, every=20)
         if start >= total or not items:
             break
     return index
