@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 revision = "profmgd490"
-down_revision = "wesrc477"
+down_revision = "savedflt"
 branch_labels = None
 depends_on = None
 

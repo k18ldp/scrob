@@ -573,13 +573,23 @@ async def mark_watched(url: str, token: str, user_id: str, item_id: str, client:
     """
     headers = _auth_headers(token)
     params = {"DatePlayed": format_date_played(played_at, date_format)} if played_at else None
+    endpoint = f"{url.rstrip('/')}/Users/{user_id}/PlayedItems/{item_id}"
+
+    async def _post(c: httpx.AsyncClient) -> bool:
+        r = await c.post(endpoint, headers=headers, params=params)
+        if r.status_code < 400:
+            return True
+        if params:
+            # Server refused the dated request: mark played without a date rather than not at all.
+            r = await c.post(endpoint, headers=headers)
+            return r.status_code < 400
+        return False
+
     try:
         if client:
-            r = await client.post(f"{url.rstrip('/')}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, params=params)
-            return r.status_code < 400
+            return await _post(client)
         async with httpx.AsyncClient(timeout=PUSH_TIMEOUT, follow_redirects=False) as c:
-            r = await c.post(f"{url.rstrip('/')}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, params=params)
-            return r.status_code < 400
+            return await _post(c)
     except Exception:
         return False
 
