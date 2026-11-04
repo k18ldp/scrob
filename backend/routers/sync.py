@@ -5578,6 +5578,54 @@ async def _get_connection_or_404(db: AsyncSession, connection_id: int, user_id: 
     return conn
 
 
+class WarningAckBody(BaseModel):
+    kind: str
+    # Hex fingerprint of the warnings being acknowledged; null un-acknowledges.
+    fingerprint: str | None = None
+
+
+@router.get("/warning-acks")
+async def get_warning_acks(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Acknowledged-warning fingerprints for each of the user's connections."""
+    from core.warning_ack import KINDS, clean_fingerprint
+    rows = (await db.execute(
+        select(MediaServerConnection.id, MediaServerConnection.acked_warnings)
+        .where(MediaServerConnection.user_id == current_user.id)
+    )).all()
+    return {
+        str(cid): {k: v for k, v in (acks or {}).items() if k in KINDS and clean_fingerprint(v)}
+        for cid, acks in rows
+    }
+
+
+@router.put("/connection/{connection_id}/warning-ack")
+async def set_warning_ack(
+    connection_id: int,
+    body: WarningAckBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Mark a connection's current pull or push warnings as seen, or undo that."""
+    from core.warning_ack import with_ack
+    conn = (await db.execute(
+        select(MediaServerConnection).where(
+            MediaServerConnection.id == connection_id,
+            MediaServerConnection.user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if conn is None:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    try:
+        conn.acked_warnings = with_ack(conn.acked_warnings, body.kind, body.fingerprint)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    await db.commit()
+    return {"acked_warnings": conn.acked_warnings}
+
+
 @router.get("/connection/{connection_id}/plex-friends")
 async def get_plex_friends(
     connection_id: int,

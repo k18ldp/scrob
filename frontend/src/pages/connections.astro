@@ -5656,16 +5656,18 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
     try {
       // Remember which warning detail panes are currently open so we can restore them after rebuild
       const expandedDetails = new Set<string>();
-      document.querySelectorAll('[id^="conn-warnings-details-"], [id^="conn-warnings-lookup-"]').forEach(el => {
+      document.querySelectorAll('[id^="conn-warnings-details-"], [id^="conn-warnings-lookup-"], [id^="conn-warnbox-"]').forEach(el => {
         if (!el.classList.contains('hidden')) expandedDetails.add(el.id);
       });
 
-      const [statusRes, overridesRes, matchedRes] = await Promise.all([
+      const [statusRes, overridesRes, matchedRes, acksRes] = await Promise.all([
         fetch('/api/proxy/sync/status', { headers: { 'Authorization': `Bearer ${token}` } }),
         fetch('/api/proxy/sync/season-overrides', { headers: { 'Authorization': `Bearer ${token}` } }),
         fetch('/api/proxy/sync/matched-shows', { headers: { 'Authorization': `Bearer ${token}` } }),
+        fetch('/api/proxy/sync/warning-acks', { headers: { 'Authorization': `Bearer ${token}` } }).catch(() => null),
       ]);
       if (!statusRes.ok) return;
+      const warningAcks: Record<string, {pull?: string, push?: string}> = acksRes && acksRes.ok ? await acksRes.json() : {};
       const jobs: any[] = await statusRes.json();
       const overrides: any[] = overridesRes.ok ? await overridesRes.json() : [];
       const matchedShows: any[] = matchedRes.ok ? await matchedRes.json() : [];
@@ -5687,6 +5689,22 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
         const stamped = raw.endsWith('Z') || raw.includes('+') ? raw : raw + 'Z';
         return new Date(stamped).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
       };
+
+      // Short hex fingerprint (cyrb53) of the warnings on screen. Acknowledging stores it,
+      // so the banner stays collapsed until the set of warnings actually changes.
+      const fingerprintWarnings = (lines: string[]) => {
+        const str = [...lines].sort().join('\n');
+        let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+        for (let i = 0; i < str.length; i++) {
+          const ch = str.charCodeAt(i);
+          h1 = Math.imul(h1 ^ ch, 2654435761);
+          h2 = Math.imul(h2 ^ ch, 1597334677);
+        }
+        h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+        h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+        return (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0');
+      };
+      const warnLine = (w: any) => [w.type, w.series_name || w.title || w.show || '', w.tmdb_id ?? '', w.season ?? '', w.media_type ?? '', w.action ?? '', w.reason ?? ''].join('|');
 
       // Pull unmatched-TMDB / enrichment vs push lookup-failed must not share a
       // job: the latest completed job with warnings used to be the Push, which
@@ -5959,10 +5977,68 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
           </div>
         ` : '';
 
+        // Acknowledged warnings collapse to one quiet line; a new or different set brings the row back.
+        const connAcks = warningAcks[connId] ?? {};
+        const pullFp = hasPullPanel ? fingerprintWarnings([...enrichmentWarnings, ...unmatchedWarnings].map(warnLine)) : '';
+        const pushFp = hasLookupPanel ? fingerprintWarnings(lookupWarnings.map(warnLine)) : '';
+        const pending: {kind: string, fp: string, count: number, changed: boolean}[] = [];
+        if (hasPullPanel && connAcks.pull !== pullFp) pending.push({kind: 'pull', fp: pullFp, count: displayCount, changed: !!connAcks.pull});
+        if (hasLookupPanel && connAcks.push !== pushFp) pending.push({kind: 'push', fp: pushFp, count: lookupDisplayCount, changed: !!connAcks.push});
+        const noticeTotal = (hasPullPanel ? 1 : 0) + (hasLookupPanel ? 1 : 0);
+        const pendingItems = pending.reduce((n, p) => n + p.count, 0);
+        const anyChanged = pending.some(p => p.changed);
+        const boxId = `conn-warnbox-${connId}`;
+        const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+        const quietChevron = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="warn-box-chevron w-4 h-4 text-zinc-500 transition-transform shrink-0"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" /></svg>`;
+
+        const summaryRow = pending.length > 0 ? `
+          <div class="flex items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2">
+            ${warnIcon}
+            <span class="flex-1 min-w-0 text-xs font-semibold text-amber-400">${plural(pending.length, 'notice')} · ${plural(pendingItems, 'item')}${anyChanged ? ' <span class="ml-1 px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-medium">new</span>' : ''}</span>
+            <button type="button" class="warn-box-toggle text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 hover:bg-zinc-800 cursor-pointer transition-colors">Details</button>
+            <button type="button" class="warn-ack-btn text-xs px-2.5 py-1.5 rounded-lg border border-amber-500/40 text-amber-400 hover:bg-amber-500/15 cursor-pointer transition-colors">Acknowledge</button>
+          </div>` : `
+          <button type="button" class="warn-box-toggle w-full flex items-center gap-2 px-2 py-1 text-left text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer transition-colors">
+            <span class="flex-1">${plural(noticeTotal, 'notice')} acknowledged</span>
+            ${quietChevron}
+          </button>`;
+
         container.classList.remove('hidden');
-        container.innerHTML = `<div class="space-y-2">${pullBanner}${lookupBanner}</div>`;
+        container.innerHTML = `${summaryRow}<div id="${boxId}" class="hidden mt-2 space-y-2">${pullBanner}${lookupBanner}</div>`;
+
+        container.querySelectorAll('.warn-box-toggle').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const box = document.getElementById(boxId);
+            box?.classList.toggle('hidden');
+            container.querySelector('.warn-box-chevron')?.classList.toggle('rotate-180');
+          });
+        });
+        container.querySelector('.warn-ack-btn')?.addEventListener('click', async (ev) => {
+          const btn = ev.currentTarget as HTMLButtonElement;
+          btn.disabled = true;
+          btn.textContent = 'Saving…';
+          try {
+            for (const p of pending) {
+              const res = await fetch(`/api/proxy/sync/connection/${connId}/warning-ack`, {
+                method: 'PUT',
+                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ kind: p.kind, fingerprint: p.fp }),
+              });
+              if (!res.ok) throw new Error(await res.text());
+            }
+            loadSyncWarnings();
+          } catch (e: any) {
+            btn.disabled = false;
+            btn.textContent = 'Acknowledge';
+            alert(`Couldn't save that: ${e.message ?? 'Unknown error'}`);
+          }
+        });
 
         // Restore expanded state if this pane was open before the rebuild
+        if (expandedDetails.has(boxId)) {
+          document.getElementById(boxId)?.classList.remove('hidden');
+          container.querySelector('.warn-box-chevron')?.classList.add('rotate-180');
+        }
         for (const id of [detailsId, lookupDetailsId]) {
           if (!expandedDetails.has(id)) continue;
           const pane = document.getElementById(id);

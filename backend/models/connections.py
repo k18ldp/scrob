@@ -40,6 +40,9 @@ class MediaServerConnection(Base):
     push_playback    : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     push_ratings     : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
+    # Fingerprints of the sync warnings the user has acknowledged: {"pull": hex, "push": hex}
+    acked_warnings   : Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
     # Auto sync interval in hours (null = disabled)
     auto_sync_interval : Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     auto_push_interval : Mapped[Optional[float]] = mapped_column(Float, nullable=True)
