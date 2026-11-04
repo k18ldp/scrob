@@ -771,6 +771,11 @@ async def _watchlist_poller():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import logging
+    from core.config import settings as _settings
+    from core.secret_check import check_secret_key
+    check_secret_key(_settings.secret_key, logging.getLogger("uvicorn.error"))
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 

@@ -30,7 +30,7 @@ services:
 
       # ── Security ────────────────────────────────────────────────────────────
       # Generate with: openssl rand -hex 32
-      SECRET_KEY: changeme
+      SECRET_KEY: ""   # REQUIRED - the app refuses to start on an empty or placeholder value
 
       # ── Logging ──────────────────────────────────────────────────────────────
       # LOG_LEVEL: "INFO"            # WARNING or higher hides the per-request access log
